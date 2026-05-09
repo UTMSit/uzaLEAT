@@ -27,6 +27,11 @@ void print_usage(const char* prog) {
               << "  --top-p F               Top-p sampling (default 0.9)\n"
               << "  --max-tokens N          Max tokens to generate (default 50)\n"
               << "  --shuffle-buffer N      Shuffle buffer size (default 10000)\n"
+              << "  --tt-rank N             TT rank for FLETTOHM (default 64)\n"
+              << "  --proj-rank N           Random projection rank (default 64)\n"
+              << "  --update-interval N     Tokens between FLETTOHM updates (default 10000)\n"
+              << "  --num-experts N         Number of MoE experts (default 6)\n"
+              << "  --window-size N         Local window size (default 4096)\n"
               << "  --help                  Show this help\n";
     exit(0);
 }
@@ -54,6 +59,11 @@ int main(int argc, char* argv[]) {
         {"top-p",          required_argument, 0, 0},
         {"max-tokens",     required_argument, 0, 0},
         {"shuffle-buffer", required_argument, 0, 0},
+        {"tt-rank",        required_argument, 0, 0},
+        {"proj-rank",      required_argument, 0, 0},
+        {"update-interval",required_argument, 0, 0},
+        {"num-experts",    required_argument, 0, 0},
+        {"window-size",    required_argument, 0, 0},
         {"help",           no_argument,       0, 'h'},
         {0,0,0,0}
     };
@@ -83,6 +93,11 @@ int main(int argc, char* argv[]) {
         else if (opt == "top-p")          config.top_p = std::stof(optarg);
         else if (opt == "max-tokens")     config.max_tokens_sample = std::stoi(optarg);
         else if (opt == "shuffle-buffer") config.shuffle_buffer = std::stoi(optarg);
+        else if (opt == "tt-rank")        config.tt_rank = std::stoi(optarg);
+        else if (opt == "proj-rank")      config.proj_rank = std::stoi(optarg);
+        else if (opt == "update-interval")config.update_interval = std::stoi(optarg);
+        else if (opt == "num-experts")    config.num_experts = std::stoi(optarg);
+        else if (opt == "window-size")    config.window_size = std::stoi(optarg);
         else if (opt == "help")      print_usage(argv[0]);
     }
 
