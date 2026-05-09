@@ -1,2 +1,4 @@
 uzaLEAT
 *.o
+*.gutr
+*.bin

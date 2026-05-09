@@ -461,21 +461,20 @@ void UzaLEATCore::train() {
     if (!prepare_tokenizer()) return;
     if (!load_plugin()) return;
 
-    std::ostringstream cfg_json;
-    cfg_json << "{";
-    cfg_json << "\"hidden_size\":" << config_.hidden_size << ",";
-    cfg_json << "\"num_layers\":" << config_.num_layers << ",";
-    cfg_json << "\"context_size\":" << config_.context_size << ",";
-    cfg_json << "\"vocab_size\":" << config_.vocab_size;
-    if (config_.use_gpu) cfg_json << ",\"use_gpu\":true";
-    cfg_json << ",\"tt_rank\":" << config_.tt_rank;
-    cfg_json << ",\"proj_rank\":" << config_.proj_rank;
-    cfg_json << ",\"update_interval\":" << config_.update_interval;
-    cfg_json << ",\"num_experts\":" << config_.num_experts;
-    cfg_json << ",\"window_size\":" << config_.window_size;
-    cfg_json << "}";
+    // Передаём все параметры через глобальные переменные ДО вызова init()
+    auto ctx = program_.global_ctx;
+    ctx->set("cfg_hidden_size", GUTRValue::integer(config_.hidden_size));
+    ctx->set("cfg_num_layers", GUTRValue::integer(config_.num_layers));
+    ctx->set("cfg_vocab_size", GUTRValue::integer(config_.vocab_size));
+    ctx->set("cfg_context_size", GUTRValue::integer(config_.context_size));
+    ctx->set("cfg_tt_rank", GUTRValue::integer(config_.tt_rank));
+    ctx->set("cfg_proj_rank", GUTRValue::integer(config_.proj_rank));
+    ctx->set("cfg_update_interval", GUTRValue::integer(config_.update_interval));
+    ctx->set("cfg_num_experts", GUTRValue::integer(config_.num_experts));
+    ctx->set("cfg_window_size", GUTRValue::integer(config_.window_size));
+    ctx->set("cfg_use_gpu", GUTRValue::boolean(config_.use_gpu));
 
-    program_.init(cfg_json.str());
+    program_.init("{}");
 
     if (!config_.model_path.empty() && std::ifstream(config_.model_path).good()) {
         std::cout << "Loading existing model from " << config_.model_path << std::endl;
