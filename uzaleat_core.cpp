@@ -468,11 +468,15 @@ void UzaLEATCore::train() {
     cfg_json << "\"context_size\":" << config_.context_size << ",";
     cfg_json << "\"vocab_size\":" << config_.vocab_size;
     if (config_.use_gpu) cfg_json << ",\"use_gpu\":true";
+    cfg_json << ",\"tt_rank\":" << config_.tt_rank;
+    cfg_json << ",\"proj_rank\":" << config_.proj_rank;
+    cfg_json << ",\"update_interval\":" << config_.update_interval;
+    cfg_json << ",\"num_experts\":" << config_.num_experts;
+    cfg_json << ",\"window_size\":" << config_.window_size;
     cfg_json << "}";
 
     program_.init(cfg_json.str());
 
-    // Load existing model if specified
     if (!config_.model_path.empty() && std::ifstream(config_.model_path).good()) {
         std::cout << "Loading existing model from " << config_.model_path << std::endl;
         program_.load(config_.model_path);

@@ -31,7 +31,7 @@ struct CoreConfig {
     size_t hidden_size = 768;
     size_t num_layers = 12;
     size_t context_size = 1024;
-    size_t vocab_size = 50257;  // will be updated after tokenizer loading
+    size_t vocab_size = 50257;
 
     int epochs = 3;
     float learning_rate = 0.0001f;
@@ -42,6 +42,12 @@ struct CoreConfig {
     int max_tokens_sample = 50;
     float temperature = 0.8f;
     float top_p = 0.9f;
+
+    int tt_rank = 64;
+    int proj_rank = 64;
+    int update_interval = 10000;
+    int num_experts = 6;
+    int window_size = 4096;
 
     bool use_gpu = false;
 };
