@@ -1,4 +1,3 @@
-// файл: uzaleat_core.hpp
 #ifndef UZALEAT_CORE_HPP
 #define UZALEAT_CORE_HPP
 
@@ -13,6 +12,7 @@
 #include <unordered_map>
 #include <functional>
 #include "gutr_vm.hpp"
+#include <dlfcn.h>
 
 #ifdef UZALEAT_USE_VULKAN
 #include "vulkan_backend.hpp"
@@ -22,6 +22,7 @@ namespace uzaleat {
 
 struct CoreConfig {
     std::string plugin_path;
+    std::string model_so_path;
     std::string data_path;
     std::string tokenizer_path;
     std::string model_path;
@@ -50,6 +51,15 @@ struct CoreConfig {
     int window_size = 4096;
 
     bool use_gpu = false;
+};
+
+struct ModelSO {
+    void* handle = nullptr;
+    void (*init)(int,int,int,int,int,int,int);
+    float (*train_step)(const int*,const int*,int,float);
+    int (*generate)(const int*,int,int*,int,float,float);
+    void (*save)(const char*);
+    void (*load)(const char*);
 };
 
 class StreamingDataset {
@@ -107,6 +117,7 @@ private:
     CoreConfig config_;
     Tokenizer tokenizer_;
     GUTRProgram program_;
+    ModelSO model_so_;
 
 #ifdef UZALEAT_USE_VULKAN
     std::unique_ptr<uzagpt::VulkanBackend> vulkan_;
@@ -115,6 +126,7 @@ private:
     static std::atomic<bool> interrupted_;
     static void signal_handler(int);
 
+    bool load_model_so(const std::string& path);
     bool load_plugin();
     bool prepare_tokenizer();
     void train();

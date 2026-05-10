@@ -385,7 +385,44 @@ GUTRValue GUTRBinaryOpExpr::eval(std::shared_ptr<GUTRContext> ctx) {
         return GUTRValue::boolean(l.bool_val && r.bool_val);
     else if (op == OR && l.type == ValueType::BOOL && r.type == ValueType::BOOL)
         return GUTRValue::boolean(l.bool_val || r.bool_val);
-
+    else if ((l.type == ValueType::TENSOR && r.type == ValueType::TENSOR) ||
+               (l.type == ValueType::TENSOR && (r.type == ValueType::INT || r.type == ValueType::FLOAT)) ||
+               ((l.type == ValueType::INT || l.type == ValueType::FLOAT) && r.type == ValueType::TENSOR)) {
+        if (l.type == ValueType::TENSOR && r.type == ValueType::TENSOR) {
+            auto tl = l.tensor_val, tr = r.tensor_val;
+            if (tl->shape != tr->shape) throw std::runtime_error("tensor shape mismatch");
+            auto res = std::make_shared<Tensor>(tl->shape);
+            for (size_t i = 0; i < tl->size(); ++i) {
+                switch(op) {
+                    case ADD: res->data[i] = tl->data[i] + tr->data[i]; break;
+                    case SUB: res->data[i] = tl->data[i] - tr->data[i]; break;
+                    case MUL: res->data[i] = tl->data[i] * tr->data[i]; break;
+                    case DIV: res->data[i] = tl->data[i] / (std::abs(tr->data[i]) > 1e-10f ? tr->data[i] : 1e-10f); break;
+                    default: throw std::runtime_error("op not supported for tensors");
+                }
+            }
+            return GUTRValue::tensor(res);
+        } else {
+            auto t = (l.type == ValueType::TENSOR) ? l.tensor_val : r.tensor_val;
+            float s = (l.type == ValueType::TENSOR) ?
+                      (r.type == ValueType::INT ? (float)r.int_val : r.float_val) :
+                      (l.type == ValueType::INT ? (float)l.int_val : l.float_val);
+            auto res = std::make_shared<Tensor>(t->shape);
+            for (size_t i = 0; i < t->size(); ++i) {
+                switch(op) {
+                    case MUL: res->data[i] = t->data[i] * s; break;
+                    case DIV: res->data[i] = t->data[i] / s; break;
+                    case ADD: res->data[i] = t->data[i] + s; break;
+                    case SUB:
+                        if (l.type == ValueType::TENSOR) res->data[i] = t->data[i] - s;
+                        else res->data[i] = s - t->data[i];
+                        break;
+                    default: throw std::runtime_error("op not supported");
+                }
+            }
+            return GUTRValue::tensor(res);
+        }
+    }
     throw std::runtime_error("type mismatch");
 }
 
@@ -1290,9 +1327,118 @@ static GUTRValue builtin_log(const std::vector<GUTRValue>& args) {
     return GUTRValue::tensor(result);
 }
 
-// ============================================================================
-// РЕГИСТРАЦИЯ ВСЕХ BUILTINS (теперь все функции видны)
-// ============================================================================
+static GUTRValue builtin_list_len(const std::vector<GUTRValue>& args) {
+    if (args.size() != 1 || args[0].type != ValueType::TUPLE)
+        throw std::runtime_error("list_len needs list");
+    return GUTRValue::integer(args[0].tuple_val.size());
+}
+
+static GUTRValue builtin_mul_tensors(const std::vector<GUTRValue>& args) {
+    if (args.size() != 2 || args[0].type != ValueType::TENSOR || args[1].type != ValueType::TENSOR)
+        throw std::runtime_error("mul_tensors needs two tensors");
+    auto a = args[0].tensor_val, b = args[1].tensor_val;
+    if (a->shape != b->shape) throw std::runtime_error("mul_tensors: shape mismatch");
+    auto res = std::make_shared<Tensor>(a->shape);
+    for (size_t i = 0; i < a->size(); ++i) res->data[i] = a->data[i] * b->data[i];
+    return GUTRValue::tensor(res);
+}
+
+static GUTRValue builtin_add_tensors(const std::vector<GUTRValue>& args) {
+    if (args.size() != 2 || args[0].type != ValueType::TENSOR || args[1].type != ValueType::TENSOR)
+        throw std::runtime_error("add_tensors needs two tensors");
+    auto a = args[0].tensor_val, b = args[1].tensor_val;
+    if (a->shape != b->shape) throw std::runtime_error("add_tensors: shape mismatch");
+    auto res = std::make_shared<Tensor>(a->shape);
+    for (size_t i = 0; i < a->size(); ++i) res->data[i] = a->data[i] + b->data[i];
+    return GUTRValue::tensor(res);
+}
+
+static GUTRValue builtin_sub_tensors(const std::vector<GUTRValue>& args) {
+    if (args.size() != 2 || args[0].type != ValueType::TENSOR || args[1].type != ValueType::TENSOR)
+        throw std::runtime_error("sub_tensors needs two tensors");
+    auto a = args[0].tensor_val, b = args[1].tensor_val;
+    if (a->shape != b->shape) throw std::runtime_error("sub_tensors: shape mismatch");
+    auto res = std::make_shared<Tensor>(a->shape);
+    for (size_t i = 0; i < a->size(); ++i) res->data[i] = a->data[i] - b->data[i];
+    return GUTRValue::tensor(res);
+}
+
+static GUTRValue builtin_div_scalar(const std::vector<GUTRValue>& args) {
+    if (args.size() != 2 || args[0].type != ValueType::TENSOR)
+        throw std::runtime_error("div_scalar needs (tensor, scalar)");
+    auto t = args[0].tensor_val;
+    float s = (args[1].type == ValueType::INT) ? (float)args[1].int_val : (float)args[1].float_val;
+    auto res = std::make_shared<Tensor>(t->shape);
+    for (size_t i = 0; i < t->size(); ++i) res->data[i] = t->data[i] / s;
+    return GUTRValue::tensor(res);
+}
+
+static GUTRValue builtin_get_element(const std::vector<GUTRValue>& args) {
+    if (args.size() != 2 || args[0].type != ValueType::TENSOR || args[1].type != ValueType::INT)
+        throw std::runtime_error("get_element needs (tensor, idx)");
+    auto t = args[0].tensor_val;
+    size_t idx = args[1].int_val;
+    if (idx >= t->size()) throw std::runtime_error("get_element: index out of bounds");
+    return GUTRValue::real(t->data[idx]);
+}
+
+static GUTRValue builtin_tensor_scalar(const std::vector<GUTRValue>& args) {
+    if (args.size() != 2 || args[0].type != ValueType::TUPLE)
+        throw std::runtime_error("tensor_scalar needs (shape, value)");
+    std::vector<size_t> shape;
+    for (auto& dim : args[0].tuple_val) shape.push_back(dim.int_val);
+    auto t = std::make_shared<Tensor>(shape);
+    float val = (args[1].type == ValueType::INT) ? args[1].int_val : args[1].float_val;
+    t->fill(val);
+    return GUTRValue::tensor(t);
+}
+
+static GUTRValue builtin_sqrt_tensor(const std::vector<GUTRValue>& args) {
+    if (args.size() != 1 || args[0].type != ValueType::TENSOR)
+        throw std::runtime_error("sqrt_tensor needs tensor");
+    auto x = args[0].tensor_val;
+    auto res = std::make_shared<Tensor>(x->shape);
+    for (size_t i = 0; i < x->size(); ++i)
+        res->data[i] = std::sqrt(std::max(0.0f, x->data[i]));
+    return GUTRValue::tensor(res);
+}
+
+static GUTRValue builtin_tensor_size(const std::vector<GUTRValue>& args) {
+    if (args.size() != 1 || args[0].type != ValueType::TENSOR)
+        throw std::runtime_error("tensor_size needs tensor");
+    return GUTRValue::integer(args[0].tensor_val->size());
+}
+
+static GUTRValue builtin_neg_tensor(const std::vector<GUTRValue>& args) {
+    if (args.size() != 1 || args[0].type != ValueType::TENSOR)
+        throw std::runtime_error("neg_tensor needs tensor");
+    auto x = args[0].tensor_val;
+    auto res = std::make_shared<Tensor>(x->shape);
+    for (size_t i = 0; i < x->size(); ++i) res->data[i] = -x->data[i];
+    return GUTRValue::tensor(res);
+}
+
+// Получение float значения из тензора размером 1
+static GUTRValue builtin_tensor_to_float(const std::vector<GUTRValue>& args) {
+    if (args.size() != 1 || args[0].type != ValueType::TENSOR)
+        throw std::runtime_error("tensor_to_float needs tensor");
+    auto t = args[0].tensor_val;
+    if (t->size() == 0) throw std::runtime_error("empty tensor");
+    return GUTRValue::real(t->data[0]);
+}
+
+// Изменение размера тензора в 1D
+static GUTRValue builtin_reshape_1d(const std::vector<GUTRValue>& args) {
+    if (args.size() != 2 || args[0].type != ValueType::TENSOR || args[1].type != ValueType::INT)
+        throw std::runtime_error("reshape_1d needs (tensor, size)");
+    auto t = args[0].tensor_val;
+    size_t new_size = args[1].int_val;
+    auto res = std::make_shared<Tensor>(std::vector<size_t>{new_size});
+    size_t copy_size = std::min(t->size(), new_size);
+    std::copy(t->data.begin(), t->data.begin() + copy_size, res->data.begin());
+    return GUTRValue::tensor(res);
+}
+
 void register_builtins(std::shared_ptr<GUTRContext> ctx) {
     ctx->define_builtin("tensor", builtin_tensor);
     ctx->define_builtin("matmul", builtin_matmul);
@@ -1323,7 +1469,6 @@ void register_builtins(std::shared_ptr<GUTRContext> ctx) {
     ctx->define_builtin("list_nth", builtin_list_nth);
     ctx->define_builtin("sect_get", builtin_sect_get);
     ctx->define_builtin("get_pair", builtin_get_pair);
-    // НОВЫЕ
     ctx->define_builtin("builtin_eye", builtin_eye);
     ctx->define_builtin("builtin_transpose", builtin_transpose);
     ctx->define_builtin("builtin_concat_1d", builtin_concat_1d);
@@ -1342,6 +1487,18 @@ void register_builtins(std::shared_ptr<GUTRContext> ctx) {
     ctx->define_builtin("builtin_rope", builtin_rope);
     ctx->define_builtin("builtin_tanh", builtin_tanh);
     ctx->define_builtin("builtin_log", builtin_log);
+    ctx->define_builtin("list_len", builtin_list_len);
+    ctx->define_builtin("mul_tensors", builtin_mul_tensors);
+    ctx->define_builtin("add_tensors", builtin_add_tensors);
+    ctx->define_builtin("sub_tensors", builtin_sub_tensors);
+    ctx->define_builtin("div_scalar", builtin_div_scalar);
+    ctx->define_builtin("get_element", builtin_get_element);
+    ctx->define_builtin("tensor_scalar", builtin_tensor_scalar);
+    ctx->define_builtin("sqrt_tensor", builtin_sqrt_tensor);
+    ctx->define_builtin("tensor_size", builtin_tensor_size);
+    ctx->define_builtin("neg_tensor", builtin_neg_tensor);
+    ctx->define_builtin("tensor_to_float", builtin_tensor_to_float);
+    ctx->define_builtin("reshape_1d", builtin_reshape_1d);
 }
 
 // ============================================================================
