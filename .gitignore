@@ -3,4 +3,5 @@ uzaLEAT
 *.gutr
 *.bin
 slesa_flettohm.cpp
-.so
+*.so
+*.gguf
