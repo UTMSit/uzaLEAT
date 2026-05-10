@@ -1,0 +1,63 @@
+// ============================================================================
+// shaders/matmul_small.comp
+// Workgroup: 4×4 (16 threads). Для матриц < 256 элементов.
+// Оптимизирован под GCN: 1 wavefront = 64 threads → 4 workgroup'ы на CU.
+// ============================================================================
+#version 450
+layout(local_size_x = 4, local_size_y = 4, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) readonly buffer A { float a[]; };
+layout(set = 0, binding = 1) readonly buffer B { float b[]; };
+layout(set = 0, binding = 2) writeonly buffer C { float c[]; };
+
+layout(push_constant) uniform Params {
+    uint M;
+    uint K;
+    uint N;
+    uint transA;
+    uint transB;
+};
+
+shared float As[4][5]; // padding для избежания bank conflicts
+shared float Bs[4][5];
+
+void main() {
+    uint row = gl_GlobalInvocationID.x;
+    uint col = gl_GlobalInvocationID.y;
+
+    float sum = 0.0;
+    uint tiles = (K + 3) / 4;
+
+    for (uint t = 0; t < tiles; t++) {
+        // Кооперативная загрузка A
+        uint aRow = row;
+        uint aCol = t * 4 + gl_LocalInvocationID.x;
+        if (aRow < M && aCol < K) {
+            As[gl_LocalInvocationID.y][gl_LocalInvocationID.x] = a[aRow * K + aCol];
+        } else {
+            As[gl_LocalInvocationID.y][gl_LocalInvocationID.x] = 0.0;
+        }
+
+        // Кооперативная загрузка B
+        uint bRow = t * 4 + gl_LocalInvocationID.y;
+        uint bCol = col;
+        if (bRow < K && bCol < N) {
+            Bs[gl_LocalInvocationID.y][gl_LocalInvocationID.x] = b[bRow * N + bCol];
+        } else {
+            Bs[gl_LocalInvocationID.y][gl_LocalInvocationID.x] = 0.0;
+        }
+
+        barrier();
+
+        // Вычисление
+        for (uint k = 0; k < 4; k++) {
+            sum += As[gl_LocalInvocationID.y][k] * Bs[k][gl_LocalInvocationID.x];
+        }
+
+        barrier();
+    }
+
+    if (row < M && col < N) {
+        c[row * N + col] = sum;
+    }
+}

@@ -1,0 +1,68 @@
+// ============================================================================
+// shaders/softmax.comp
+// Workgroup: 256. Параллельная редукция через shared memory.
+// Поддерживает 2D: [rows, cols] — софтмакс по строкам.
+// ============================================================================
+#version 450
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) readonly buffer Input { float input_data[]; };
+layout(set = 0, binding = 1) writeonly buffer Output { float output_data[]; };
+
+layout(push_constant) uniform Params {
+    uint rows;
+    uint cols;
+};
+
+shared float shared_max[256];
+shared float shared_sum[256];
+
+void main() {
+    uint row = gl_GlobalInvocationID.x;
+    uint tid = gl_LocalInvocationID.x;
+
+    if (row >= rows) return;
+
+    // Шаг 1: найти максимум в строке
+    float max_val = -1e30;
+    for (uint i = tid; i < cols; i += 256) {
+        float val = input_data[row * cols + i];
+        if (val > max_val) max_val = val;
+    }
+    shared_max[tid] = max_val;
+    barrier();
+
+    for (uint stride = 128; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            float other = shared_max[tid + stride];
+            if (other > shared_max[tid]) shared_max[tid] = other;
+        }
+        barrier();
+    }
+    max_val = shared_max[0];
+    barrier();
+
+    // Шаг 2: exp и сумма
+    float sum = 0.0;
+    for (uint i = tid; i < cols; i += 256) {
+        float val = exp(input_data[row * cols + i] - max_val);
+        output_data[row * cols + i] = val;
+        sum += val;
+    }
+    shared_sum[tid] = sum;
+    barrier();
+
+    for (uint stride = 128; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            shared_sum[tid] += shared_sum[tid + stride];
+        }
+        barrier();
+    }
+    sum = shared_sum[0];
+
+    // Шаг 3: нормализация
+    float inv_sum = 1.0 / (sum + 1e-8);
+    for (uint i = tid; i < cols; i += 256) {
+        output_data[row * cols + i] *= inv_sum;
+    }
+}

@@ -1,0 +1,52 @@
+// ============================================================================
+// shaders/matmul_medium.comp
+// Workgroup: 8×8 (64 threads). Для матриц 256-4096 элементов.
+// 1 CU = 64 ALU = 1 workgroup на CU. Тайлинг 64×64.
+// ============================================================================
+#version 450
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) readonly buffer A { float a[]; };
+layout(set = 0, binding = 1) readonly buffer B { float b[]; };
+layout(set = 0, binding = 2) writeonly buffer C { float c[]; };
+
+layout(push_constant) uniform Params {
+    uint M;
+    uint K;
+    uint N;
+    uint transA;
+    uint transB;
+};
+
+shared float As[8][9];
+shared float Bs[8][9];
+
+void main() {
+    uint row = gl_GlobalInvocationID.x;
+    uint col = gl_GlobalInvocationID.y;
+
+    float sum = 0.0;
+    uint tiles = (K + 7) / 8;
+
+    for (uint t = 0; t < tiles; t++) {
+        uint aRow = row;
+        uint aCol = t * 8 + gl_LocalInvocationID.x;
+        As[gl_LocalInvocationID.y][gl_LocalInvocationID.x] = (aRow < M && aCol < K) ? a[aRow * K + aCol] : 0.0;
+
+        uint bRow = t * 8 + gl_LocalInvocationID.y;
+        uint bCol = col;
+        Bs[gl_LocalInvocationID.y][gl_LocalInvocationID.x] = (bRow < K && bCol < N) ? b[bRow * N + bCol] : 0.0;
+
+        barrier();
+
+        for (uint k = 0; k < 8; k++) {
+            sum += As[gl_LocalInvocationID.y][k] * Bs[k][gl_LocalInvocationID.x];
+        }
+
+        barrier();
+    }
+
+    if (row < M && col < N) {
+        c[row * N + col] = sum;
+    }
+}

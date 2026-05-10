@@ -1,0 +1,28 @@
+// ============================================================================
+// shaders/gelu_fp16.comp
+// GELU с FP16 packed math.
+// ============================================================================
+#version 450
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) readonly buffer Input { float16_t data[]; };
+layout(set = 0, binding = 1) writeonly buffer Output { float16_t out_data[]; };
+
+layout(push_constant) uniform Params {
+    uint n;
+};
+
+const float16_t SQRT_2_OVER_PI = float16_t(0.7978845608028654);
+const float16_t COEFF = float16_t(0.044715);
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= n) return;
+
+    float16_t x = data[i];
+    float16_t x3 = x * x * x;
+    float16_t tanh_arg = fma(COEFF, x3, x) * SQRT_2_OVER_PI;
+    out_data[i] = float16_t(0.5) * x * (float16_t(1.0) + tanh(tanh_arg));
+}

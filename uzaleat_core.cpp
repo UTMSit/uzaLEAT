@@ -10,6 +10,11 @@
 #include <chrono>
 #include <filesystem>
 #include <csignal>
+#include "vulkan_backend.hpp"
+
+#ifdef UZALEAT_USE_VULKAN
+extern std::unique_ptr<uzagpt::VulkanBackend> g_vk_global;
+#endif
 
 #ifdef _OPENMP
 #include <omp.h>
@@ -407,6 +412,8 @@ UzaLEATCore::UzaLEATCore(const CoreConfig& config) : config_(config), model_so_{
             std::cerr << "Vulkan init failed, falling back to CPU\n";
             vulkan_.reset();
             config_.use_gpu = false;
+        } else {
+            g_vk_global = std::move(vulkan_);
         }
     }
 #endif
@@ -427,6 +434,8 @@ bool UzaLEATCore::load_model_so(const std::string& path) {
     model_so_.generate   = (decltype(model_so_.generate))   dlsym(model_so_.handle, "model_generate");
     model_so_.save       = (decltype(model_so_.save))       dlsym(model_so_.handle, "model_save");
     model_so_.load       = (decltype(model_so_.load))       dlsym(model_so_.handle, "model_load");
+    model_so_.get_tokenizer_size = (decltype(model_so_.get_tokenizer_size)) dlsym(model_so_.handle, "model_get_tokenizer_size");
+    model_so_.get_tokenizer_data = (decltype(model_so_.get_tokenizer_data)) dlsym(model_so_.handle, "model_get_tokenizer_data");
 
     if (!model_so_.init || !model_so_.train_step || !model_so_.generate || !model_so_.save || !model_so_.load) {
         std::cerr << "Model .so missing required symbols (need: model_init, model_train_step, model_generate, model_save, model_load)" << std::endl;
@@ -489,10 +498,18 @@ void UzaLEATCore::train() {
 
     if (use_so) {
         if (!load_model_so(config_.model_so_path)) return;
-        model_so_.init(config_.hidden_size, config_.num_layers, config_.vocab_size,
-                       config_.context_size, config_.tt_rank, config_.num_experts,
-                       config_.window_size);
-    } else if (use_gutr) {
+    }
+
+    if (!config_.model_path.empty() && std::ifstream(config_.model_path).good()) {
+        std::cout << "Loading existing model from " << config_.model_path << std::endl;
+        if (use_so) model_so_.load(config_.model_path.c_str());
+        else program_.load(config_.model_path);
+    } else {
+        if (use_so) {
+            model_so_.init(config_.hidden_size, config_.num_layers, config_.vocab_size,
+                           config_.context_size, config_.tt_rank, config_.num_experts,
+                           config_.window_size, config_.update_interval);
+        } else if (use_gutr) {
         if (!load_plugin()) return;
         program_.set_global("H", GUTRValue::integer(config_.hidden_size));
         program_.set_global("L", GUTRValue::integer(config_.num_layers));
@@ -507,12 +524,7 @@ void UzaLEATCore::train() {
     } else {
         std::cerr << "Error: need --plugin or --model-so\n";
         return;
-    }
-
-    if (!config_.model_path.empty() && std::ifstream(config_.model_path).good()) {
-        std::cout << "Loading existing model from " << config_.model_path << std::endl;
-        if (use_so) model_so_.load(config_.model_path.c_str());
-        else program_.load(config_.model_path);
+        }
     }
 
     StreamingDataset dataset(config_.data_path, config_.shuffle_buffer);
@@ -573,33 +585,49 @@ void UzaLEATCore::chat() {
 
     if (use_so) {
         if (!load_model_so(config_.model_so_path)) return;
+        // Загружаем модель (токенизатор загрузится внутри model_load, если он там есть)
+        model_so_.load(config_.model_path.c_str());
     } else if (use_gutr) {
         if (!load_plugin()) return;
+        program_.load(config_.model_path);
     } else {
         std::cerr << "Error: need --plugin or --model-so\n";
         return;
     }
 
-    if (!config_.tokenizer_path.empty()) {
+    // Пробуем загрузить токенизатор из .so модели, если он там встроен
+    if (use_so && model_so_.get_tokenizer_size && model_so_.get_tokenizer_data) {
+        size_t sz = model_so_.get_tokenizer_size();
+        if (sz > 0) {
+            std::vector<char> buf(sz);
+            model_so_.get_tokenizer_data(buf.data(), sz);
+            // Сохраняем во временный файл и загружаем через существующий tokenizer_.load()
+            std::string tmp_path = "_tok_cache.bin";
+            std::ofstream tmp(tmp_path, std::ios::binary);
+            tmp.write(buf.data(), sz);
+            tmp.close();
+            tokenizer_.load(tmp_path);
+            std::remove(tmp_path.c_str());
+            std::cout << "Loaded tokenizer from model (vocab=" << tokenizer_.vocab_size() << ")" << std::endl;
+        }
+    }
+    // Пробуем загрузить токенизатор из отдельного файла
+    if (!config_.tokenizer_path.empty() && std::ifstream(config_.tokenizer_path).good()) {
         try { tokenizer_.load(config_.tokenizer_path); }
         catch (const std::exception& e) {
-            std::cerr << "Failed to load tokenizer: " << e.what() << std::endl;
-            return;
+            std::cerr << "Failed to load tokenizer from file: " << e.what() << std::endl;
         }
-    } else {
-        std::cerr << "Tokenizer file required (--tokenizer)\n";
+    }
+
+    // Если токенизатор не загрузился ни из файла, ни из GGUF — ошибка
+    if (tokenizer_.vocab_size() == 0) {
+        std::cerr << "Tokenizer not found. Provide --tokenizer or use a GGUF with embedded tokenizer.\n";
         return;
     }
 
-    if (config_.model_path.empty() || !std::ifstream(config_.model_path).good()) {
-        std::cerr << "Error: no valid model file (--model)\n";
-        return;
-    }
-
-    if (use_so) model_so_.load(config_.model_path.c_str());
-    else program_.load(config_.model_path);
-
+    std::cout << "Tokenizer loaded, vocab size = " << tokenizer_.vocab_size() << std::endl;
     std::cout << "Chat mode. Type 'quit' to exit.\n";
+
     std::string prompt;
     while (true) {
         std::cout << "> ";

@@ -1,0 +1,64 @@
+// ============================================================================
+// shaders/matmul_small_vec4.comp
+// Версия small с векторизованными загрузками vec4.
+// ============================================================================
+#version 450
+layout(local_size_x = 4, local_size_y = 4, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) readonly buffer A { float a[]; };
+layout(set = 0, binding = 1) readonly buffer B { float b[]; };
+layout(set = 0, binding = 2) writeonly buffer C { float c[]; };
+
+layout(push_constant) uniform Params {
+    uint M;
+    uint K;
+    uint N;
+    uint transA;
+    uint transB;
+};
+
+shared vec4 As[4];
+shared vec4 Bs[4];
+
+void main() {
+    uint row = gl_GlobalInvocationID.x;
+    uint col = gl_GlobalInvocationID.y;
+
+    float sum = 0.0;
+    uint tiles = (K + 15) / 16;
+
+    for (uint t = 0; t < tiles; t++) {
+        // Векторизованная загрузка по 4 float за раз
+        uint aRow = row;
+        uint aCol = t * 16 + gl_LocalInvocationID.x * 4;
+        if (aRow < M && aCol + 3 < K) {
+            As[gl_LocalInvocationID.y] = vec4(
+                a[aRow * K + aCol],
+                a[aRow * K + aCol + 1],
+                a[aRow * K + aCol + 2],
+                a[aRow * K + aCol + 3]
+            );
+        }
+
+        uint bRow = t * 16 + gl_LocalInvocationID.y * 4;
+        uint bCol = col;
+        if (bRow + 3 < K && bCol < N) {
+            Bs[gl_LocalInvocationID.y] = vec4(
+                b[bRow * N + bCol],
+                b[(bRow + 1) * N + bCol],
+                b[(bRow + 2) * N + bCol],
+                b[(bRow + 3) * N + bCol]
+            );
+        }
+
+        barrier();
+
+        sum += dot(As[gl_LocalInvocationID.y], Bs[gl_LocalInvocationID.x]);
+
+        barrier();
+    }
+
+    if (row < M && col < N) {
+        c[row * N + col] = sum;
+    }
+}
