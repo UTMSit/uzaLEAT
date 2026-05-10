@@ -1,0 +1,39 @@
+// ============================================================================
+// shaders/rms_norm.comp
+// Workgroup: 256. RMSNorm с параллельной редукцией.
+// ============================================================================
+#version 450
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) readonly buffer Input { float data[]; };
+layout(set = 0, binding = 1) writeonly buffer Output { float out_data[]; };
+
+layout(push_constant) uniform Params {
+    uint n;
+};
+
+shared float shared_sq[256];
+
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+
+    float sum_sq = 0.0;
+    for (uint i = tid; i < n; i += 256) {
+        float v = data[i];
+        sum_sq += v * v;
+    }
+    shared_sq[tid] = sum_sq;
+    barrier();
+
+    for (uint stride = 128; stride > 0; stride >>= 1) {
+        if (tid < stride) shared_sq[tid] += shared_sq[tid + stride];
+        barrier();
+    }
+
+    float rms = sqrt(shared_sq[0] / float(n) + 1e-8);
+    float inv_rms = 1.0 / rms;
+
+    for (uint i = tid; i < n; i += 256) {
+        out_data[i] = data[i] * inv_rms;
+    }
+}

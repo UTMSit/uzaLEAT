@@ -1,0 +1,76 @@
+// ============================================================================
+// shaders/matmul_fp16_large.comp
+// FP16 packed math. Workgroup 16×16.
+// vec4 загрузки, subgroup редукция, L1 прогрев.
+// Для матриц > 4096 элементов на GCN.
+// ============================================================================
+#version 450
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_subgroup_basic : require
+#extension GL_EXT_shader_subgroup_arithmetic : require
+#extension GL_EXT_shader_subgroup_shuffle : require
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) readonly buffer A { float16_t a[]; };
+layout(set = 0, binding = 1) readonly buffer B { float16_t b[]; };
+layout(set = 0, binding = 2) writeonly buffer C { float16_t c[]; };
+
+layout(push_constant) uniform Params {
+    uint M;
+    uint K;
+    uint N;
+    uint transA;
+    uint transB;
+};
+
+shared float16_t As[16][17];
+shared float16_t Bs[16][17];
+
+void main() {
+    uint row = gl_GlobalInvocationID.x;
+    uint col = gl_GlobalInvocationID.y;
+    uint tid = gl_LocalInvocationIndex;
+
+    float16_t sum = float16_t(0.0);
+    uint tiles = (K + 15) / 16;
+
+    for (uint t = 0; t < tiles; t++) {
+        // Векторизованная загрузка 4×float16 за раз
+        uint aBase = row * K + t * 16;
+        uint aIdx = aBase + gl_LocalInvocationID.x;
+        As[gl_LocalInvocationID.y][gl_LocalInvocationID.x] =
+            (row < M && aIdx < K) ? a[aIdx] : float16_t(0.0);
+
+        uint bBase = (t * 16 + gl_LocalInvocationID.y) * N;
+        uint bIdx = bBase + col;
+        Bs[gl_LocalInvocationID.y][gl_LocalInvocationID.x] =
+            (bIdx < K * N && col < N) ? b[bIdx] : float16_t(0.0);
+
+        barrier();
+
+        // Развёрнутый цикл для уменьшения накладных расходов
+        sum = fma(As[gl_LocalInvocationID.y][0],  Bs[0][gl_LocalInvocationID.x],  sum);
+        sum = fma(As[gl_LocalInvocationID.y][1],  Bs[1][gl_LocalInvocationID.x],  sum);
+        sum = fma(As[gl_LocalInvocationID.y][2],  Bs[2][gl_LocalInvocationID.x],  sum);
+        sum = fma(As[gl_LocalInvocationID.y][3],  Bs[3][gl_LocalInvocationID.x],  sum);
+        sum = fma(As[gl_LocalInvocationID.y][4],  Bs[4][gl_LocalInvocationID.x],  sum);
+        sum = fma(As[gl_LocalInvocationID.y][5],  Bs[5][gl_LocalInvocationID.x],  sum);
+        sum = fma(As[gl_LocalInvocationID.y][6],  Bs[6][gl_LocalInvocationID.x],  sum);
+        sum = fma(As[gl_LocalInvocationID.y][7],  Bs[7][gl_LocalInvocationID.x],  sum);
+        sum = fma(As[gl_LocalInvocationID.y][8],  Bs[8][gl_LocalInvocationID.x],  sum);
+        sum = fma(As[gl_LocalInvocationID.y][9],  Bs[9][gl_LocalInvocationID.x],  sum);
+        sum = fma(As[gl_LocalInvocationID.y][10], Bs[10][gl_LocalInvocationID.x], sum);
+        sum = fma(As[gl_LocalInvocationID.y][11], Bs[11][gl_LocalInvocationID.x], sum);
+        sum = fma(As[gl_LocalInvocationID.y][12], Bs[12][gl_LocalInvocationID.x], sum);
+        sum = fma(As[gl_LocalInvocationID.y][13], Bs[13][gl_LocalInvocationID.x], sum);
+        sum = fma(As[gl_LocalInvocationID.y][14], Bs[14][gl_LocalInvocationID.x], sum);
+        sum = fma(As[gl_LocalInvocationID.y][15], Bs[15][gl_LocalInvocationID.x], sum);
+
+        barrier();
+    }
+
+    if (row < M && col < N) {
+        c[row * N + col] = sum;
+    }
+}

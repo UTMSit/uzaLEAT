@@ -1,0 +1,42 @@
+// ============================================================================
+// shaders/wkv_fp16.comp
+// WKV с FP16 packed math для ускорения на GCN.
+// ============================================================================
+#version 450
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) readonly buffer K { float16_t k[]; };
+layout(set = 0, binding = 1) readonly buffer V { float16_t v[]; };
+layout(set = 0, binding = 2) buffer State { float16_t state[]; };
+layout(set = 0, binding = 3) writeonly buffer Out { float16_t out_val[]; };
+layout(set = 0, binding = 4) readonly buffer Decay { float16_t decay[]; };
+layout(set = 0, binding = 5) readonly buffer First { float16_t first[]; };
+
+layout(push_constant) uniform Params {
+    uint n_embd;
+};
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= n_embd) return;
+
+    float16_t k_t = k[i];
+    float16_t v_t = v[i];
+    float16_t d = exp(decay[i]);
+    float16_t f = first[i];
+    float16_t s = state[i];
+
+    float16_t log_efk = f + k_t;
+    float16_t max_val = max(log_efk, float16_t(0.0));
+    float16_t exp_efk = exp(log_efk - max_val);
+    float16_t exp_d = d * exp(float16_t(0.0) - max_val);
+
+    float16_t num = fma(exp_efk, v_t, exp_d * s);
+    float16_t den = exp_efk + exp_d;
+
+    float16_t wkv_val = num / (den + float16_t(1e-8));
+    out_val[i] = wkv_val;
+    state[i] = wkv_val;
+}

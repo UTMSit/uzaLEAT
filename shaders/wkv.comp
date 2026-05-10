@@ -1,0 +1,40 @@
+// ============================================================================
+// shaders/wkv.comp
+// Workgroup: 256. Каждый поток считает один элемент WKV.
+// ============================================================================
+#version 450
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) readonly buffer K { float k[]; };
+layout(set = 0, binding = 1) readonly buffer V { float v[]; };
+layout(set = 0, binding = 2) buffer State { float state[]; };
+layout(set = 0, binding = 3) writeonly buffer Out { float out_val[]; };
+layout(set = 0, binding = 4) readonly buffer Decay { float decay[]; };
+layout(set = 0, binding = 5) readonly buffer First { float first[]; };
+
+layout(push_constant) uniform Params {
+    uint n_embd;
+};
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= n_embd) return;
+
+    float k_t = k[i];
+    float v_t = v[i];
+    float d = exp(decay[i]);
+    float f = first[i];
+    float s = state[i];
+
+    float log_efk = f + k_t;
+    float max_val = max(log_efk, 0.0);
+    float exp_efk = exp(log_efk - max_val);
+    float exp_d = d * exp(-max_val);
+
+    float num = exp_efk * v_t + exp_d * s;
+    float den = exp_efk + exp_d;
+
+    float wkv_val = num / (den + 1e-8);
+    out_val[i] = wkv_val;
+    state[i] = wkv_val;
+}

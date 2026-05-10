@@ -55,11 +55,13 @@ struct CoreConfig {
 
 struct ModelSO {
     void* handle = nullptr;
-    void (*init)(int,int,int,int,int,int,int);
+    void (*init)(int,int,int,int,int,int,int,int);
     float (*train_step)(const int*,const int*,int,float);
     int (*generate)(const int*,int,int*,int,float,float);
     void (*save)(const char*);
     void (*load)(const char*);
+    size_t (*get_tokenizer_size)();
+    void (*get_tokenizer_data)(char*, size_t);
 };
 
 class StreamingDataset {
