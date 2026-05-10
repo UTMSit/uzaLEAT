@@ -1,4 +1,3 @@
-// файл: uzaleat_core.cpp
 #include "uzaleat_core.hpp"
 #include "gutr_parser.hpp"
 #include <iostream>
@@ -214,7 +213,7 @@ void StreamingDataset::reset() {
 }
 
 // -------------------------------------------------------------------
-// Tokenizer implementation (Byte Pair Encoding)
+// Tokenizer
 // -------------------------------------------------------------------
 Tokenizer::Tokenizer() {}
 
@@ -399,7 +398,7 @@ void Tokenizer::load(const std::string& path) {
 // -------------------------------------------------------------------
 void UzaLEATCore::signal_handler(int) { interrupted_ = true; }
 
-UzaLEATCore::UzaLEATCore(const CoreConfig& config) : config_(config) {
+UzaLEATCore::UzaLEATCore(const CoreConfig& config) : config_(config), model_so_{} {
     std::signal(SIGINT, signal_handler);
 #ifdef UZALEAT_USE_VULKAN
     if (config_.use_gpu) {
@@ -413,7 +412,31 @@ UzaLEATCore::UzaLEATCore(const CoreConfig& config) : config_(config) {
 #endif
 }
 
-UzaLEATCore::~UzaLEATCore() = default;
+UzaLEATCore::~UzaLEATCore() {
+    if (model_so_.handle) dlclose(model_so_.handle);
+}
+
+bool UzaLEATCore::load_model_so(const std::string& path) {
+    model_so_.handle = dlopen(path.c_str(), RTLD_NOW);
+    if (!model_so_.handle) {
+        std::cerr << "Failed to load model .so: " << dlerror() << std::endl;
+        return false;
+    }
+    model_so_.init       = (decltype(model_so_.init))       dlsym(model_so_.handle, "model_init");
+    model_so_.train_step = (decltype(model_so_.train_step)) dlsym(model_so_.handle, "model_train_step");
+    model_so_.generate   = (decltype(model_so_.generate))   dlsym(model_so_.handle, "model_generate");
+    model_so_.save       = (decltype(model_so_.save))       dlsym(model_so_.handle, "model_save");
+    model_so_.load       = (decltype(model_so_.load))       dlsym(model_so_.handle, "model_load");
+
+    if (!model_so_.init || !model_so_.train_step || !model_so_.generate || !model_so_.save || !model_so_.load) {
+        std::cerr << "Model .so missing required symbols (need: model_init, model_train_step, model_generate, model_save, model_load)" << std::endl;
+        dlclose(model_so_.handle);
+        model_so_.handle = nullptr;
+        return false;
+    }
+    std::cout << "Model .so loaded: " << path << std::endl;
+    return true;
+}
 
 bool UzaLEATCore::load_plugin() {
     std::ifstream file(config_.plugin_path);
@@ -460,24 +483,36 @@ bool UzaLEATCore::prepare_tokenizer() {
 
 void UzaLEATCore::train() {
     if (!prepare_tokenizer()) return;
-    if (!load_plugin()) return;
 
-    // Передаём параметры через set_global ДО вызова init()
-    program_.set_global("H", GUTRValue::integer(config_.hidden_size));
-    program_.set_global("L", GUTRValue::integer(config_.num_layers));
-    program_.set_global("V", GUTRValue::integer(config_.vocab_size));
-    program_.set_global("ctx_len", GUTRValue::integer(config_.context_size));
-    program_.set_global("tt_rank", GUTRValue::integer(config_.tt_rank));
-    program_.set_global("proj_rank", GUTRValue::integer(config_.proj_rank));
-    program_.set_global("update_interval", GUTRValue::integer(config_.update_interval));
-    program_.set_global("num_experts", GUTRValue::integer(config_.num_experts));
-    program_.set_global("window_size", GUTRValue::integer(config_.window_size));
+    bool use_so = !config_.model_so_path.empty();
+    bool use_gutr = !config_.plugin_path.empty();
 
-    program_.init("{}");
+    if (use_so) {
+        if (!load_model_so(config_.model_so_path)) return;
+        model_so_.init(config_.hidden_size, config_.num_layers, config_.vocab_size,
+                       config_.context_size, config_.tt_rank, config_.num_experts,
+                       config_.window_size);
+    } else if (use_gutr) {
+        if (!load_plugin()) return;
+        program_.set_global("H", GUTRValue::integer(config_.hidden_size));
+        program_.set_global("L", GUTRValue::integer(config_.num_layers));
+        program_.set_global("V", GUTRValue::integer(config_.vocab_size));
+        program_.set_global("ctx_len", GUTRValue::integer(config_.context_size));
+        program_.set_global("tt_rank", GUTRValue::integer(config_.tt_rank));
+        program_.set_global("proj_rank", GUTRValue::integer(config_.proj_rank));
+        program_.set_global("update_interval", GUTRValue::integer(config_.update_interval));
+        program_.set_global("num_experts", GUTRValue::integer(config_.num_experts));
+        program_.set_global("window_size", GUTRValue::integer(config_.window_size));
+        program_.init("{}");
+    } else {
+        std::cerr << "Error: need --plugin or --model-so\n";
+        return;
+    }
 
     if (!config_.model_path.empty() && std::ifstream(config_.model_path).good()) {
         std::cout << "Loading existing model from " << config_.model_path << std::endl;
-        program_.load(config_.model_path);
+        if (use_so) model_so_.load(config_.model_path.c_str());
+        else program_.load(config_.model_path);
     }
 
     StreamingDataset dataset(config_.data_path, config_.shuffle_buffer);
@@ -488,8 +523,10 @@ void UzaLEATCore::train() {
         std::pair<std::string, std::string> ex;
         while (dataset.next(ex)) {
             if (interrupted_) {
-                std::cout << "\nInterrupted. Saving...\n";
-                program_.save(config_.model_path.empty() ? "interrupted.gguf" : config_.model_path);
+                std::string save_path = config_.model_path.empty() ? "interrupted.gguf" : config_.model_path;
+                std::cout << "\nInterrupted. Saving to " << save_path << "...\n";
+                if (use_so) model_so_.save(save_path.c_str());
+                else program_.save(save_path);
                 return;
             }
             auto inp = tokenizer_.encode(ex.first);
@@ -498,50 +535,84 @@ void UzaLEATCore::train() {
             size_t seq_len = std::min({inp.size(), tgt.size(), config_.context_size});
             inp.resize(seq_len);
             tgt.resize(seq_len);
-            program_.train_step(inp, tgt, config_.learning_rate);
+
+            if (use_so)
+                model_so_.train_step(inp.data(), tgt.data(), seq_len, config_.learning_rate);
+            else
+                program_.train_step(inp, tgt, config_.learning_rate);
+
             ++steps; ++step;
-            if (steps % 10 == 0) {
+            if (steps % 10 == 0)
                 std::cout << "\rEpoch " << epoch+1 << " Step " << steps << std::flush;
-            }
+
             if (step % config_.sample_every == 0) {
                 std::vector<int> gen(config_.max_tokens_sample);
-                int len = program_.generate(inp, gen, config_.max_tokens_sample, config_.temperature, config_.top_p);
+                int len;
+                if (use_so)
+                    len = model_so_.generate(inp.data(), inp.size(), gen.data(), config_.max_tokens_sample,
+                                            config_.temperature, config_.top_p);
+                else
+                    len = program_.generate(inp, gen, config_.max_tokens_sample, config_.temperature, config_.top_p);
                 std::cout << "\n[Sample] " << tokenizer_.decode(std::vector<int>(gen.begin(), gen.begin()+len)) << "\n";
             }
         }
         std::cout << "\nEpoch " << epoch+1 << " done.\n";
-        program_.save("checkpoint_epoch_" + std::to_string(epoch+1) + ".gguf");
+        std::string ckpt = "checkpoint_epoch_" + std::to_string(epoch+1) + ".gguf";
+        if (use_so) model_so_.save(ckpt.c_str());
+        else program_.save(ckpt);
     }
-    program_.save(config_.model_path.empty() ? "final.gguf" : config_.model_path);
+    std::string final_path = config_.model_path.empty() ? "final.gguf" : config_.model_path;
+    if (use_so) model_so_.save(final_path.c_str());
+    else program_.save(final_path);
+    std::cout << "Training complete. Model saved to " << final_path << std::endl;
 }
 
 void UzaLEATCore::chat() {
-    if (!load_plugin()) return;
+    bool use_so = !config_.model_so_path.empty();
+    bool use_gutr = !config_.plugin_path.empty();
+
+    if (use_so) {
+        if (!load_model_so(config_.model_so_path)) return;
+    } else if (use_gutr) {
+        if (!load_plugin()) return;
+    } else {
+        std::cerr << "Error: need --plugin or --model-so\n";
+        return;
+    }
+
     if (!config_.tokenizer_path.empty()) {
-        try {
-            tokenizer_.load(config_.tokenizer_path);
-        } catch (const std::exception& e) {
+        try { tokenizer_.load(config_.tokenizer_path); }
+        catch (const std::exception& e) {
             std::cerr << "Failed to load tokenizer: " << e.what() << std::endl;
             return;
         }
     } else {
-        std::cerr << "Tokenizer file required for chat mode (--tokenizer)\n";
+        std::cerr << "Tokenizer file required (--tokenizer)\n";
         return;
     }
+
     if (config_.model_path.empty() || !std::ifstream(config_.model_path).good()) {
-        std::cerr << "Error: no valid model file specified (--model).\n";
+        std::cerr << "Error: no valid model file (--model)\n";
         return;
     }
-    program_.load(config_.model_path);
-    std::string prompt;
+
+    if (use_so) model_so_.load(config_.model_path.c_str());
+    else program_.load(config_.model_path);
+
     std::cout << "Chat mode. Type 'quit' to exit.\n";
+    std::string prompt;
     while (true) {
         std::cout << "> ";
         std::getline(std::cin, prompt);
         if (prompt == "quit") break;
         auto inp = tokenizer_.encode(prompt);
         std::vector<int> gen(config_.max_tokens_sample);
-        int len = program_.generate(inp, gen, config_.max_tokens_sample, config_.temperature, config_.top_p);
+        int len;
+        if (use_so)
+            len = model_so_.generate(inp.data(), inp.size(), gen.data(), config_.max_tokens_sample,
+                                    config_.temperature, config_.top_p);
+        else
+            len = program_.generate(inp, gen, config_.max_tokens_sample, config_.temperature, config_.top_p);
         std::cout << tokenizer_.decode(std::vector<int>(gen.begin(), gen.begin()+len)) << std::endl;
     }
 }

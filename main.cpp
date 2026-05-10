@@ -1,10 +1,8 @@
-// файл: main.cpp
 #include <iostream>
 #include <csignal>
 #include <getopt.h>
 #include "uzaleat_core.hpp"
 
-// Условная компиляция для OpenMP
 #ifdef _OPENMP
 #include <omp.h>
 #endif
@@ -12,11 +10,12 @@
 void print_usage(const char* prog) {
     std::cout << "Usage: " << prog << " [options]\n"
               << "Options:\n"
-              << "  --plugin FILE           .gutr plugin file (required)\n"
+              << "  --plugin FILE           .gutr plugin file\n"
+              << "  --model-so FILE         .so model file (alternative to --plugin)\n"
               << "  --train                 Training mode\n"
               << "  --chat                  Chat mode\n"
-              << "  --data PATH             Training data path (file or directory with JSON lines)\n"
-              << "  --tokenizer FILE        Tokenizer file (load/save)\n"
+              << "  --data PATH             Training data path\n"
+              << "  --tokenizer FILE        Tokenizer file\n"
               << "  --model FILE            Model file (output/input GGUF)\n"
               << "  --hidden N              Hidden size (default 768)\n"
               << "  --layers N              Number of layers (default 12)\n"
@@ -31,7 +30,7 @@ void print_usage(const char* prog) {
               << "  --top-p F               Top-p sampling (default 0.9)\n"
               << "  --max-tokens N          Max tokens to generate (default 50)\n"
               << "  --shuffle-buffer N      Shuffle buffer size (default 10000)\n"
-              << "  --tt-rank N             TT rank for FLETTOHM (default 64)\n"
+              << "  --tt-rank N             TT rank (default 64)\n"
               << "  --proj-rank N           Random projection rank (default 64)\n"
               << "  --update-interval N     Tokens between FLETTOHM updates (default 10000)\n"
               << "  --num-experts N         Number of MoE experts (default 6)\n"
@@ -45,6 +44,7 @@ int main(int argc, char* argv[]) {
 
     static struct option long_opts[] = {
         {"plugin",         required_argument, 0, 0},
+        {"model-so",       required_argument, 0, 0},
         {"train",          no_argument,       0, 0},
         {"chat",           no_argument,       0, 0},
         {"data",           required_argument, 0, 0},
@@ -79,6 +79,7 @@ int main(int argc, char* argv[]) {
 
         const std::string opt = long_opts[option_index].name;
         if (opt == "plugin")         config.plugin_path = optarg;
+        else if (opt == "model-so")  config.model_so_path = optarg;
         else if (opt == "train")     config.train_mode = true;
         else if (opt == "chat")      config.chat_mode = true;
         else if (opt == "data")      config.data_path = optarg;
@@ -109,8 +110,8 @@ int main(int argc, char* argv[]) {
         std::cerr << "Error: specify --train or --chat\n";
         print_usage(argv[0]);
     }
-    if (config.plugin_path.empty()) {
-        std::cerr << "Error: --plugin required\n";
+    if (config.plugin_path.empty() && config.model_so_path.empty()) {
+        std::cerr << "Error: need --plugin or --model-so\n";
         print_usage(argv[0]);
     }
 

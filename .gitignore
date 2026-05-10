@@ -2,3 +2,5 @@ uzaLEAT
 *.o
 *.gutr
 *.bin
+slesa_flettohm.cpp
+.so
