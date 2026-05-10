@@ -15,12 +15,19 @@
 #include <cfloat>
 #include <unordered_map>
 #include <limits>
+#include <cassert>
 
 #ifdef _OPENMP
 #include <omp.h>
 #endif
 
 namespace uzaleat {
+
+// ============================================================================
+// КОНСТАНТЫ
+// ============================================================================
+constexpr float EPSILON = 1e-8f;
+constexpr float MAX_EXP = 80.0f;
 
 // ============================================================================
 // БАЗОВАЯ ЛИНЕЙНАЯ АЛГЕБРА
@@ -45,6 +52,14 @@ static inline void vec_scale(float* v, size_t n, float s) {
 static inline void vec_copy(float* dst, const float* src, size_t n) {
     #pragma omp simd
     for (size_t i = 0; i < n; ++i) dst[i] = src[i];
+}
+
+static inline float safe_exp(float x) {
+    if (std::isnan(x)) return 1.0f;
+    if (std::isinf(x)) return (x > 0) ? std::numeric_limits<float>::infinity() : 0.0f;
+    if (x > MAX_EXP) return std::exp(MAX_EXP);
+    if (x < -MAX_EXP) return std::exp(-MAX_EXP);
+    return std::exp(x);
 }
 
 // QR через Хаусхолдера: A [m,n] -> Q [m,n], R [n,n]
@@ -178,7 +193,7 @@ struct ROSAInstance {
     std::vector<int> link, len, pos;
     std::vector<int> tokens;
 
-    ROSAInstance() {}
+    ROSAInstance() : s(0), g(0), z(0) {}
     void init(int max_len) {
         s = 2 * max_len + 1;
         next.resize(s);
@@ -225,8 +240,10 @@ struct ROSAInstance {
     }
 };
 
+// Глобальные переменные для ROSA ДОЛЖНЫ БЫТЬ ЗДЕСЬ
 static std::unordered_map<int64_t, std::shared_ptr<ROSAInstance>> rosa_instances;
 static int64_t next_rosa_id = 1;
+static std::mutex rosa_mutex;
 
 // ============================================================================
 // Tensor implementation
@@ -235,6 +252,7 @@ Tensor::Tensor() : requires_grad(true) {}
 Tensor::Tensor(const std::vector<size_t>& sh, bool req_grad) : shape(sh), requires_grad(req_grad) {
     size_t sz = 1;
     for (auto d : shape) sz *= d;
+    if (sz == 0) sz = 1;
     data.resize(sz, 0.0f);
     if (requires_grad) grad.resize(sz, 0.0f);
 }
@@ -243,11 +261,13 @@ size_t Tensor::size() const { size_t s = 1; for (auto d : shape) s *= d; return 
 void Tensor::zero_grad() { if (requires_grad) std::fill(grad.begin(), grad.end(), 0.0f); }
 void Tensor::fill(float value) { std::fill(data.begin(), data.end(), value); }
 void Tensor::random_normal(float mean, float stddev) {
+    if (stddev <= 0.0f) { std::fill(data.begin(), data.end(), mean); return; }
     thread_local static std::mt19937 gen(std::random_device{}());
     std::normal_distribution<float> dist(mean, stddev);
     for (auto& v : data) v = dist(gen);
 }
 void Tensor::random_uniform(float min, float max) {
+    if (min >= max) { std::fill(data.begin(), data.end(), min); return; }
     thread_local static std::mt19937 gen(std::random_device{}());
     std::uniform_real_distribution<float> dist(min, max);
     for (auto& v : data) v = dist(gen);
@@ -305,6 +325,17 @@ void GUTRContext::define_builtin(const std::string& name, GUTRBuiltinFunction::F
 // ============================================================================
 GUTRLiteralExpr::GUTRLiteralExpr(const GUTRValue& v) : value(v) {}
 GUTRValue GUTRLiteralExpr::eval(std::shared_ptr<GUTRContext> ctx) { (void)ctx; return value; }
+std::string GUTRLiteralExpr::to_string() const {
+    switch (value.type) {
+        case ValueType::NIL: return "nil";
+        case ValueType::BOOL: return value.bool_val ? "true" : "false";
+        case ValueType::INT: return std::to_string(value.int_val);
+        case ValueType::FLOAT: return std::to_string(value.float_val);
+        case ValueType::STRING: return "\"" + value.string_val + "\"";
+        default: return "<literal>";
+    }
+}
+
 GUTRVarExpr::GUTRVarExpr(const std::string& n) : name(n) {}
 GUTRValue GUTRVarExpr::eval(std::shared_ptr<GUTRContext> ctx) { return ctx->get(name); }
 
@@ -356,6 +387,26 @@ GUTRValue GUTRBinaryOpExpr::eval(std::shared_ptr<GUTRContext> ctx) {
         return GUTRValue::boolean(l.bool_val || r.bool_val);
 
     throw std::runtime_error("type mismatch");
+}
+
+std::string GUTRBinaryOpExpr::to_string() const {
+    std::string op_str;
+    switch (op) {
+        case ADD: op_str = "+"; break;
+        case SUB: op_str = "-"; break;
+        case MUL: op_str = "*"; break;
+        case DIV: op_str = "/"; break;
+        case LT: op_str = "<"; break;
+        case GT: op_str = ">"; break;
+        case EQ: op_str = "=="; break;
+        case NE: op_str = "!="; break;
+        case LE: op_str = "<="; break;
+        case GE: op_str = ">="; break;
+        case AND: op_str = "&&"; break;
+        case OR: op_str = "||"; break;
+        default: op_str = "?";
+    }
+    return "(" + left->to_string() + " " + op_str + " " + right->to_string() + ")";
 }
 
 GUTRValue GUTRUnaryOpExpr::eval(std::shared_ptr<GUTRContext> ctx) {
@@ -418,7 +469,9 @@ GUTRValue GUTRIfStmt::eval(std::shared_ptr<GUTRContext> ctx) {
     return GUTRValue::nil();
 }
 GUTRValue GUTRWhileStmt::eval(std::shared_ptr<GUTRContext> ctx) {
-    while (true) {
+    int max_iterations = 1000000;
+    int iterations = 0;
+    while (iterations < max_iterations) {
         GUTRValue cond = condition->eval(ctx);
         if (cond.type != ValueType::BOOL) throw std::runtime_error("while condition must be boolean");
         if (!cond.bool_val) break;
@@ -426,6 +479,7 @@ GUTRValue GUTRWhileStmt::eval(std::shared_ptr<GUTRContext> ctx) {
         if (ctx->break_flag) { ctx->break_flag = false; break; }
         if (ctx->continue_flag) { ctx->continue_flag = false; continue; }
         if (ctx->return_value.type != ValueType::NIL) break;
+        iterations++;
     }
     return GUTRValue::nil();
 }
@@ -436,7 +490,10 @@ GUTRValue GUTRForStmt::eval(std::shared_ptr<GUTRContext> ctx) {
         throw std::runtime_error("for bounds must be int");
     int64_t start = start_val.int_val, end = end_val.int_val, step = step_val.int_val;
     if (step == 0) throw std::runtime_error("step cannot be zero");
+    int64_t max_iterations = 1000000;
+    int64_t count = 0;
     for (int64_t i = start; (step > 0) ? (i < end) : (i > end); i += step) {
+        if (count++ >= max_iterations) throw std::runtime_error("for loop exceeded max iterations");
         ctx->set(var_name, GUTRValue::integer(i));
         body->eval(ctx);
         if (ctx->break_flag) { ctx->break_flag = false; break; }
@@ -458,6 +515,7 @@ GUTRValue GUTRArrayLiteralExpr::eval(std::shared_ptr<GUTRContext> ctx) {
 }
 GUTRValue GUTRFunctionDefExpr::eval(std::shared_ptr<GUTRContext> ctx) {
     auto func = std::make_shared<GUTRUserFunction>();
+    func->name = name;
     func->param_names = params;
     func->body = body;
     func->closure = ctx;
@@ -472,13 +530,8 @@ GUTRValue GUTRSectDefExpr::eval(std::shared_ptr<GUTRContext> ctx) {
 }
 
 // ============================================================================
-// ВСТРОЕННЫЕ ФУНКЦИИ
+// ВСЕ ВСТРОЕННЫЕ ФУНКЦИИ (ДОЛЖНЫ БЫТЬ ПЕРЕД register_builtins)
 // ============================================================================
-static float safe_exp(float x) {
-    if (x > 80.0f) return std::exp(80.0f);
-    if (x < -80.0f) return std::exp(-80.0f);
-    return std::exp(x);
-}
 
 static GUTRValue builtin_tensor(const std::vector<GUTRValue>& args) {
     if (args.empty()) throw std::runtime_error("tensor requires shape");
@@ -1054,7 +1107,8 @@ static GUTRValue builtin_solve_linear(const std::vector<GUTRValue>& args) {
         for (int i = (int)n - 1; i >= 0; --i) {
             float sum = QtB[i * m + col];
             for (size_t j = i + 1; j < n; ++j) sum -= R[i * n + j] * X->data[j * m + col];
-            X->data[i * m + col] = (std::abs(R[i * n + i]) < 1e-8f) ? sum / 0.001f : sum / R[i * n + i];
+            float r_val = R[i * n + i];
+            X->data[i * m + col] = (std::abs(r_val) < 1e-8f) ? sum / 0.001f : sum / r_val;
         }
     }
     return GUTRValue::tensor(X);
@@ -1063,6 +1117,7 @@ static GUTRValue builtin_solve_linear(const std::vector<GUTRValue>& args) {
 static GUTRValue builtin_rosa_create(const std::vector<GUTRValue>& args) {
     if (args.size() != 1 || args[0].type != ValueType::INT)
         throw std::runtime_error("rosa_create needs max_len");
+    std::lock_guard<std::mutex> lock(rosa_mutex);
     int64_t id = next_rosa_id++;
     auto rosa = std::make_shared<ROSAInstance>();
     rosa->init(args[0].int_val);
@@ -1073,12 +1128,22 @@ static GUTRValue builtin_rosa_create(const std::vector<GUTRValue>& args) {
 static GUTRValue builtin_rosa_update_and_query(const std::vector<GUTRValue>& args) {
     if (args.size() != 2 || args[0].type != ValueType::INT || args[1].type != ValueType::INT)
         throw std::runtime_error("rosa_update_and_query needs (id, token)");
+    std::lock_guard<std::mutex> lock(rosa_mutex);
     int64_t id = args[0].int_val;
     int token = args[1].int_val;
     auto it = rosa_instances.find(id);
     if (it == rosa_instances.end()) throw std::runtime_error("ROSA instance not found");
     int predicted = it->second->update_and_query(token);
     return GUTRValue::integer(predicted);
+}
+
+static GUTRValue builtin_rosa_destroy(const std::vector<GUTRValue>& args) {
+    if (args.size() != 1 || args[0].type != ValueType::INT)
+        throw std::runtime_error("rosa_destroy needs id");
+    std::lock_guard<std::mutex> lock(rosa_mutex);
+    int64_t id = args[0].int_val;
+    rosa_instances.erase(id);
+    return GUTRValue::nil();
 }
 
 static GUTRValue builtin_set_element(const std::vector<GUTRValue>& args) {
@@ -1226,7 +1291,7 @@ static GUTRValue builtin_log(const std::vector<GUTRValue>& args) {
 }
 
 // ============================================================================
-// РЕГИСТРАЦИЯ ВСЕХ BUILTINS
+// РЕГИСТРАЦИЯ ВСЕХ BUILTINS (теперь все функции видны)
 // ============================================================================
 void register_builtins(std::shared_ptr<GUTRContext> ctx) {
     ctx->define_builtin("tensor", builtin_tensor);
@@ -1266,6 +1331,7 @@ void register_builtins(std::shared_ptr<GUTRContext> ctx) {
     ctx->define_builtin("builtin_solve_linear", builtin_solve_linear);
     ctx->define_builtin("builtin_rosa_create", builtin_rosa_create);
     ctx->define_builtin("builtin_rosa_update_and_query", builtin_rosa_update_and_query);
+    ctx->define_builtin("builtin_rosa_destroy", builtin_rosa_destroy);
     ctx->define_builtin("builtin_set_element", builtin_set_element);
     ctx->define_builtin("builtin_set_element_2d", builtin_set_element_2d);
     ctx->define_builtin("builtin_scale", builtin_scale);
@@ -1283,7 +1349,7 @@ void register_builtins(std::shared_ptr<GUTRContext> ctx) {
 // ============================================================================
 void GUTRProgram::init(const std::string& config_json) {
     if (!init_func) throw std::runtime_error("No init function");
-    auto ctx = std::make_shared<GUTRContext>();
+    auto ctx = std::make_shared<GUTRContext>(global_ctx);
     register_builtins(ctx);
     init_func->call({GUTRValue::string(config_json)});
 }
@@ -1318,7 +1384,9 @@ int GUTRProgram::generate(const std::vector<int>& prompt, std::vector<int>& outp
                                           GUTRValue::real(temp), GUTRValue::real(top_p)});
     if (res.type == ValueType::TUPLE) {
         output.clear();
-        for (auto& v : res.tuple_val) output.push_back(v.int_val);
+        for (auto& v : res.tuple_val) {
+            if (v.type == ValueType::INT) output.push_back(v.int_val);
+        }
         return output.size();
     }
     return 0;

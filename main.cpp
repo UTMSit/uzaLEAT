@@ -2,8 +2,12 @@
 #include <iostream>
 #include <csignal>
 #include <getopt.h>
-#include <omp.h>
 #include "uzaleat_core.hpp"
+
+// Условная компиляция для OpenMP
+#ifdef _OPENMP
+#include <omp.h>
+#endif
 
 void print_usage(const char* prog) {
     std::cout << "Usage: " << prog << " [options]\n"
