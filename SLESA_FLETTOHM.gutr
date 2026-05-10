@@ -1,53 +1,34 @@
 fn init(config_json) {
-    H = get_global("cfg_hidden_size");
-    L = get_global("cfg_num_layers");
-    V = get_global("cfg_vocab_size");
-    ctx_len = get_global("cfg_context_size");
-    tt_rank = get_global("cfg_tt_rank");
-    proj_rank = get_global("cfg_proj_rank");
-    update_interval = get_global("cfg_update_interval");
-    num_experts = get_global("cfg_num_experts");
-    window_size = get_global("cfg_window_size");
-
     top_k_experts = 2;
-    pref_lobe_dim = H / 4;
+    pref_lobe_dim = get_global("H") / 4;
     pref_lobe_steps = 4;
     num_hypotheses = 5;
     lambda_reg = 0.001;
 
-    set_global("H", H);
-    set_global("L", L);
-    set_global("V", V);
-    set_global("ctx_len", ctx_len);
-    set_global("tt_rank", tt_rank);
-    set_global("proj_rank", proj_rank);
-    set_global("update_interval", update_interval);
-    set_global("lambda_reg", lambda_reg);
-    set_global("num_experts", num_experts);
     set_global("top_k_experts", top_k_experts);
-    set_global("window_size", window_size);
-    set_global("pref_lobe_steps", pref_lobe_steps);
     set_global("pref_lobe_dim", pref_lobe_dim);
+    set_global("pref_lobe_steps", pref_lobe_steps);
     set_global("num_hypotheses", num_hypotheses);
+    set_global("lambda_reg", lambda_reg);
 
-    R = tensor(list(H, proj_rank), "random_normal", 0.0, 0.02);
+    R = tensor(list(get_global("H"), get_global("proj_rank")), "random_normal", 0.0, 0.02);
     set_global("R", R);
 
-    emb = tensor(list(V, H), "random_normal", 0.0, 0.02);
+    emb = tensor(list(get_global("V"), get_global("H")), "random_normal", 0.0, 0.02);
     set_global("emb", emb);
 
     layers = list();
     l = 0;
-    while (l < L) {
-        append(layers, create_cortex_layer(H, tt_rank, num_experts));
+    while (l < get_global("L")) {
+        append(layers, create_cortex_layer(get_global("H"), get_global("tt_rank"), get_global("num_experts")));
         l = l + 1;
     }
     set_global("layers", layers);
 
-    set_global("preflobe", create_prefrontal_lobe(H, pref_lobe_dim, tt_rank));
-    set_global("head", create_tt_matrix(V, H, tt_rank));
-    set_global("stats", create_stats_storage(L, H, proj_rank));
-    set_global("rosa_id", builtin_rosa_create(ctx_len * 2));
+    set_global("preflobe", create_prefrontal_lobe(get_global("H"), get_global("pref_lobe_dim"), get_global("tt_rank")));
+    set_global("head", create_tt_matrix(get_global("V"), get_global("H"), get_global("tt_rank")));
+    set_global("stats", create_stats_storage(get_global("L"), get_global("H"), get_global("proj_rank")));
+    set_global("rosa_id", builtin_rosa_create(get_global("ctx_len") * 2));
     set_global("step_count", 0);
     set_global("total_tokens", 0);
 

@@ -1,5 +1,6 @@
 // файл: uzaleat_core.cpp
 #include "uzaleat_core.hpp"
+#include "gutr_parser.hpp"
 #include <iostream>
 #include <sstream>
 #include <iomanip>
@@ -461,18 +462,16 @@ void UzaLEATCore::train() {
     if (!prepare_tokenizer()) return;
     if (!load_plugin()) return;
 
-    // Передаём все параметры через глобальные переменные ДО вызова init()
-    auto ctx = program_.global_ctx;
-    ctx->set("cfg_hidden_size", GUTRValue::integer(config_.hidden_size));
-    ctx->set("cfg_num_layers", GUTRValue::integer(config_.num_layers));
-    ctx->set("cfg_vocab_size", GUTRValue::integer(config_.vocab_size));
-    ctx->set("cfg_context_size", GUTRValue::integer(config_.context_size));
-    ctx->set("cfg_tt_rank", GUTRValue::integer(config_.tt_rank));
-    ctx->set("cfg_proj_rank", GUTRValue::integer(config_.proj_rank));
-    ctx->set("cfg_update_interval", GUTRValue::integer(config_.update_interval));
-    ctx->set("cfg_num_experts", GUTRValue::integer(config_.num_experts));
-    ctx->set("cfg_window_size", GUTRValue::integer(config_.window_size));
-    ctx->set("cfg_use_gpu", GUTRValue::boolean(config_.use_gpu));
+    // Передаём параметры через set_global ДО вызова init()
+    program_.set_global("H", GUTRValue::integer(config_.hidden_size));
+    program_.set_global("L", GUTRValue::integer(config_.num_layers));
+    program_.set_global("V", GUTRValue::integer(config_.vocab_size));
+    program_.set_global("ctx_len", GUTRValue::integer(config_.context_size));
+    program_.set_global("tt_rank", GUTRValue::integer(config_.tt_rank));
+    program_.set_global("proj_rank", GUTRValue::integer(config_.proj_rank));
+    program_.set_global("update_interval", GUTRValue::integer(config_.update_interval));
+    program_.set_global("num_experts", GUTRValue::integer(config_.num_experts));
+    program_.set_global("window_size", GUTRValue::integer(config_.window_size));
 
     program_.init("{}");
 
