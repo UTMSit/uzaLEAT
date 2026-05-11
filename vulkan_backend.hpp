@@ -18,7 +18,7 @@ struct GPUConfig {
     bool enable_fp16_math = true;
     bool enable_push_descriptors = false;
     uint32_t buffer_pool_size_mb = 512;
-    uint32_t max_buffers = 256;
+    uint32_t max_buffers = 4096;
     uint32_t staging_buffer_size_mb = 64;
 };
 
@@ -50,6 +50,8 @@ public:
     void free_buffer(GPUBuffer* buf);
     void upload_to_buffer(GPUBuffer* dst, const void* src, size_t size);
     void download_from_buffer(void* dst, GPUBuffer* src, size_t size);
+    void upload_to_buffer_batched(GPUBuffer* dst, const void* src, size_t size);
+    void download_from_buffer_batched(void* dst, GPUBuffer* src, size_t size);
 
     void begin_batch();
     void end_batch();
@@ -127,6 +129,13 @@ private:
     VkDeviceSize pool_used_ = 0;
 
     GPUBuffer staging_buffer_;
+    struct PendingDownload {
+        void* dst;
+        size_t size;
+        size_t offset;
+    };
+    std::vector<PendingDownload> pending_downloads_;
+    size_t staging_used_ = 0;
     size_t staging_offset_ = 0;
 
     uint32_t max_workgroup_size_ = 256;
