@@ -812,7 +812,40 @@ void VulkanBackend::download_from_buffer(void* dst, GPUBuffer* src, size_t size)
     memcpy(dst, staging_buffer_.mapped, size);
     vkResetCommandBuffer(current_cmd_, 0);
 }
+void VulkanBackend::upload_to_buffer_batched(GPUBuffer* dst, const void* src, size_t size) {
+    if (!dst || !src || size == 0) return;
+    if (size > staging_buffer_.size) return;
+    ensure_batch_open();
+    memcpy(staging_buffer_.mapped, src, size);
+    VkBufferCopy r = {}; r.size = size;
+    vkCmdCopyBuffer(current_cmd_, staging_buffer_.buffer, dst->buffer, 1, &r);
+    VkBufferMemoryBarrier b = {VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER};
+    b.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    b.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+    b.buffer = dst->buffer; b.size = size;
+    vkCmdPipelineBarrier(current_cmd_, VK_PIPELINE_STAGE_TRANSFER_BIT,
+        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, nullptr, 1, &b, 0, nullptr);
+}
 
+void VulkanBackend::download_from_buffer_batched(void* dst, GPUBuffer* src, size_t size) {
+    if (!dst || !src || size == 0) return;
+        if (staging_used_ + size > staging_buffer_.size) {
+            std::cerr << "VulkanBackend: FATAL staging overflow " << (staging_used_ + size)
+                      << " > " << staging_buffer_.size << std::endl;
+            std::abort();
+        }
+    ensure_batch_open();
+    VkBufferMemoryBarrier b = {VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER};
+    b.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+    b.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+    b.buffer = src->buffer; b.size = size;
+    vkCmdPipelineBarrier(current_cmd_, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+        VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 1, &b, 0, nullptr);
+    VkBufferCopy r = {}; r.dstOffset = staging_used_; r.size = size;
+    vkCmdCopyBuffer(current_cmd_, src->buffer, staging_buffer_.buffer, 1, &r);
+    pending_downloads_.push_back({dst, size, staging_used_});
+    staging_used_ += size;
+}
 // ============================================================================
 // Батчинг
 // ============================================================================
@@ -827,6 +860,11 @@ void VulkanBackend::ensure_batch_open() {
 }
 
 void VulkanBackend::begin_batch() {
+    if (batch_open_) {
+        end_batch();
+    }
+    pending_downloads_.clear();
+    staging_used_ = 0;
     ensure_batch_open();
 }
 
@@ -843,22 +881,24 @@ void VulkanBackend::end_batch() {
     vkResetFences(device_, 1, &batch_fence_);
     VkResult result = vkQueueSubmit(compute_queue_, 1, &submitInfo, batch_fence_);
     if (result != VK_SUCCESS) {
-        std::cerr << "VulkanBackend: vkQueueSubmit failed with error " << result << std::endl;
+        std::cerr << "VulkanBackend: vkQueueSubmit failed" << std::endl;
         return;
     }
 
     result = vkWaitForFences(device_, 1, &batch_fence_, VK_TRUE, UINT64_MAX);
     if (result != VK_SUCCESS) {
-        std::cerr << "VulkanBackend: vkWaitForFences failed with error " << result << std::endl;
+        std::cerr << "VulkanBackend: vkWaitForFences failed" << std::endl;
         return;
     }
 
+    for (auto& dl : pending_downloads_) {
+        memcpy(dl.dst, (char*)staging_buffer_.mapped + dl.offset, dl.size);
+    }
+    pending_downloads_.clear();
+    staging_used_ = 0;
+
     vkResetCommandBuffer(current_cmd_, 0);
     batch_open_ = false;
-}
-
-void VulkanBackend::flush() {
-    end_batch();
 }
 
 // ============================================================================
