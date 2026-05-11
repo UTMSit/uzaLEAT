@@ -436,6 +436,7 @@ bool UzaLEATCore::load_model_so(const std::string& path) {
     model_so_.load       = (decltype(model_so_.load))       dlsym(model_so_.handle, "model_load");
     model_so_.get_tokenizer_size = (decltype(model_so_.get_tokenizer_size)) dlsym(model_so_.handle, "model_get_tokenizer_size");
     model_so_.get_tokenizer_data = (decltype(model_so_.get_tokenizer_data)) dlsym(model_so_.handle, "model_get_tokenizer_data");
+    model_so_.load_holdout = (decltype(model_so_.load_holdout)) dlsym(model_so_.handle, "model_load_holdout");
 
     if (!model_so_.init || !model_so_.train_step || !model_so_.generate || !model_so_.save || !model_so_.load) {
         std::cerr << "Model .so missing required symbols (need: model_init, model_train_step, model_generate, model_save, model_load)" << std::endl;
@@ -509,6 +510,12 @@ void UzaLEATCore::train() {
             model_so_.init(config_.hidden_size, config_.num_layers, config_.vocab_size,
                            config_.context_size, config_.tt_rank, config_.num_experts,
                            config_.window_size, config_.update_interval);
+        } if (use_so && model_so_.load_holdout) {
+            std::ifstream hf("holdout.jsonl");
+            if (hf.good()) {
+                hf.close();
+                model_so_.load_holdout("holdout.jsonl");
+            }
         } else if (use_gutr) {
         if (!load_plugin()) return;
         program_.set_global("H", GUTRValue::integer(config_.hidden_size));
