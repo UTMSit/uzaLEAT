@@ -62,6 +62,7 @@ struct ModelSO {
     void (*load)(const char*);
     size_t (*get_tokenizer_size)();
     void (*get_tokenizer_data)(char*, size_t);
+    void (*load_holdout)(const char*);
 };
 
 class StreamingDataset {
