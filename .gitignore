@@ -5,3 +5,4 @@ uzaLEAT
 slesa_flettohm.cpp
 *.so
 *.gguf
+*.txt

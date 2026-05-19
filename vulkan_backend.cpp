@@ -46,7 +46,43 @@ static std::vector<uint32_t> load_spirv_file(const char* path) {
 // Конструктор / Деструктор
 // ============================================================================
 VulkanBackend::VulkanBackend() {
-    memset(this, 0, sizeof(*this));
+    // Убрать memset — он ломает std::list, std::mutex, std::vector
+    instance_ = VK_NULL_HANDLE;
+    physical_device_ = VK_NULL_HANDLE;
+    device_ = VK_NULL_HANDLE;
+    compute_queue_ = VK_NULL_HANDLE;
+    transfer_queue_ = VK_NULL_HANDLE;
+    compute_family_ = 0;
+    transfer_family_ = 0;
+    cmd_pool_ = VK_NULL_HANDLE;
+    current_cmd_ = VK_NULL_HANDLE;
+    batch_fence_ = VK_NULL_HANDLE;
+    batch_open_ = false;
+    transfer_cmd_pool_ = VK_NULL_HANDLE;
+    transfer_cmd_ = VK_NULL_HANDLE;
+    transfer_fence_ = VK_NULL_HANDLE;
+    desc_pool_ = VK_NULL_HANDLE;
+    desc_layout_ = VK_NULL_HANDLE;
+    pipeline_layout_ = VK_NULL_HANDLE;
+    matmul_small_pipeline_ = VK_NULL_HANDLE;
+    matmul_medium_pipeline_ = VK_NULL_HANDLE;
+    matmul_large_pipeline_ = VK_NULL_HANDLE;
+    softmax_pipeline_ = VK_NULL_HANDLE;
+    wkv_pipeline_ = VK_NULL_HANDLE;
+    gelu_pipeline_ = VK_NULL_HANDLE;
+    sigmoid_pipeline_ = VK_NULL_HANDLE;
+    rms_norm_pipeline_ = VK_NULL_HANDLE;
+    ew_mul_pipeline_ = VK_NULL_HANDLE;
+    ew_add_pipeline_ = VK_NULL_HANDLE;
+    pool_total_ = 0;
+    pool_used_ = 0;
+    staging_used_ = 0;
+    staging_offset_ = 0;
+    max_workgroup_size_ = 256;
+    max_workgroup_invocations_ = 1024;
+    max_shared_memory_ = 32768;
+    has_fp16_ = false;
+    has_async_compute_ = false;
 }
 
 VulkanBackend::~VulkanBackend() {
@@ -96,35 +132,20 @@ void VulkanBackend::shutdown() {
     if (device_ == VK_NULL_HANDLE) return;
     vkDeviceWaitIdle(device_);
 
-    auto destroyBuffer = [this](GPUBuffer& buf) {
-        if (buf.buffer != VK_NULL_HANDLE) {
-            vkDestroyBuffer(device_, buf.buffer, nullptr);
-            buf.buffer = VK_NULL_HANDLE;
-        }
-        if (buf.memory != VK_NULL_HANDLE) {
-            vkFreeMemory(device_, buf.memory, nullptr);
-            buf.memory = VK_NULL_HANDLE;
-        }
-        buf.size = 0;
-        buf.mapped = nullptr;
-    };
-
-    destroyBuffer(staging_buffer_);
-
-    for (auto& entry : buffer_pool_) {
-        destroyBuffer(entry.buffer);
+    // 1. Удалить staging
+    if (staging_buffer_.buffer != VK_NULL_HANDLE) {
+        vkDestroyBuffer(device_, staging_buffer_.buffer, nullptr);
+        staging_buffer_.buffer = VK_NULL_HANDLE;
     }
-    buffer_pool_.clear();
-    pool_total_ = 0;
-    pool_used_ = 0;
+    if (staging_buffer_.memory != VK_NULL_HANDLE) {
+        vkFreeMemory(device_, staging_buffer_.memory, nullptr);
+        staging_buffer_.memory = VK_NULL_HANDLE;
+    }
 
+    // 2. Пайплайны ПЕРЕД device
     auto destroyPipeline = [this](VkPipeline& p) {
-        if (p != VK_NULL_HANDLE) {
-            vkDestroyPipeline(device_, p, nullptr);
-            p = VK_NULL_HANDLE;
-        }
+        if (p != VK_NULL_HANDLE) { vkDestroyPipeline(device_, p, nullptr); p = VK_NULL_HANDLE; }
     };
-
     destroyPipeline(matmul_small_pipeline_);
     destroyPipeline(matmul_medium_pipeline_);
     destroyPipeline(matmul_large_pipeline_);
@@ -136,47 +157,22 @@ void VulkanBackend::shutdown() {
     destroyPipeline(ew_mul_pipeline_);
     destroyPipeline(ew_add_pipeline_);
 
-    if (pipeline_layout_ != VK_NULL_HANDLE) {
-        vkDestroyPipelineLayout(device_, pipeline_layout_, nullptr);
-        pipeline_layout_ = VK_NULL_HANDLE;
-    }
+    if (pipeline_layout_ != VK_NULL_HANDLE) { vkDestroyPipelineLayout(device_, pipeline_layout_, nullptr); pipeline_layout_ = VK_NULL_HANDLE; }
+    if (desc_pool_ != VK_NULL_HANDLE) { vkDestroyDescriptorPool(device_, desc_pool_, nullptr); desc_pool_ = VK_NULL_HANDLE; }
+    if (desc_layout_ != VK_NULL_HANDLE) { vkDestroyDescriptorSetLayout(device_, desc_layout_, nullptr); desc_layout_ = VK_NULL_HANDLE; }
+    if (batch_fence_ != VK_NULL_HANDLE) { vkDestroyFence(device_, batch_fence_, nullptr); batch_fence_ = VK_NULL_HANDLE; }
+    if (transfer_fence_ != VK_NULL_HANDLE) { vkDestroyFence(device_, transfer_fence_, nullptr); transfer_fence_ = VK_NULL_HANDLE; }
+    if (cmd_pool_ != VK_NULL_HANDLE) { vkDestroyCommandPool(device_, cmd_pool_, nullptr); cmd_pool_ = VK_NULL_HANDLE; }
 
-    if (desc_pool_ != VK_NULL_HANDLE) {
-        vkDestroyDescriptorPool(device_, desc_pool_, nullptr);
-        desc_pool_ = VK_NULL_HANDLE;
-    }
-
-    if (desc_layout_ != VK_NULL_HANDLE) {
-        vkDestroyDescriptorSetLayout(device_, desc_layout_, nullptr);
-        desc_layout_ = VK_NULL_HANDLE;
-    }
-
-    if (batch_fence_ != VK_NULL_HANDLE) {
-        vkDestroyFence(device_, batch_fence_, nullptr);
-        batch_fence_ = VK_NULL_HANDLE;
-    }
-
-    if (transfer_fence_ != VK_NULL_HANDLE) {
-        vkDestroyFence(device_, transfer_fence_, nullptr);
-        transfer_fence_ = VK_NULL_HANDLE;
-    }
-
-    if (cmd_pool_ != VK_NULL_HANDLE) {
-        vkDestroyCommandPool(device_, cmd_pool_, nullptr);
-        cmd_pool_ = VK_NULL_HANDLE;
-    }
-
-    if (transfer_cmd_pool_ != VK_NULL_HANDLE && transfer_cmd_pool_ != cmd_pool_) {
-        vkDestroyCommandPool(device_, transfer_cmd_pool_, nullptr);
-        transfer_cmd_pool_ = VK_NULL_HANDLE;
-    }
-
+    // 3. device
     vkDestroyDevice(device_, nullptr);
     device_ = VK_NULL_HANDLE;
 
+    // 4. instance
     vkDestroyInstance(instance_, nullptr);
     instance_ = VK_NULL_HANDLE;
 
+    // 5. Остальные поля
     physical_device_ = VK_NULL_HANDLE;
     compute_queue_ = VK_NULL_HANDLE;
     transfer_queue_ = VK_NULL_HANDLE;
@@ -289,17 +285,9 @@ void VulkanBackend::create_logical_device() {
     computeQueueCreateInfo.queueCount = 1;
     computeQueueCreateInfo.pQueuePriorities = &queuePriority;
 
-    VkDeviceQueueCreateInfo transferQueueCreateInfo = {};
-    transferQueueCreateInfo.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO;
-    transferQueueCreateInfo.queueFamilyIndex = transfer_family_;
-    transferQueueCreateInfo.queueCount = 1;
-    transferQueueCreateInfo.pQueuePriorities = &queuePriority;
-
     std::vector<VkDeviceQueueCreateInfo> queueCreateInfos;
     queueCreateInfos.push_back(computeQueueCreateInfo);
-    if (transfer_family_ != compute_family_) {
-        queueCreateInfos.push_back(transferQueueCreateInfo);
-    }
+    // НЕ создаём transfer очередь — используем compute для всего
 
     VkPhysicalDeviceFeatures deviceFeatures = {};
 
@@ -321,7 +309,7 @@ void VulkanBackend::create_logical_device() {
 // ============================================================================
 void VulkanBackend::create_queues() {
     vkGetDeviceQueue(device_, compute_family_, 0, &compute_queue_);
-    vkGetDeviceQueue(device_, transfer_family_, 0, &transfer_queue_);
+    transfer_queue_ = compute_queue_;  // одна очередь для всего
 }
 
 // ============================================================================
@@ -347,20 +335,10 @@ void VulkanBackend::create_command_pools() {
 
     vkAllocateCommandBuffers(device_, &allocInfo, &current_cmd_);
 
-    if (transfer_family_ != compute_family_ && config_.enable_async_transfer) {
-        VkCommandPoolCreateInfo transferPoolInfo = {};
-        transferPoolInfo.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
-        transferPoolInfo.queueFamilyIndex = transfer_family_;
-        transferPoolInfo.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
-
-        vkCreateCommandPool(device_, &transferPoolInfo, nullptr, &transfer_cmd_pool_);
-
-        allocInfo.commandPool = transfer_cmd_pool_;
-        vkAllocateCommandBuffers(device_, &allocInfo, &transfer_cmd_);
-    } else {
-        transfer_cmd_pool_ = cmd_pool_;
-        transfer_cmd_ = current_cmd_;
-    }
+    // ВСЕГДА используем compute pool — без отдельных transfer очередей
+    transfer_cmd_pool_ = cmd_pool_;
+    transfer_cmd_ = current_cmd_;
+    transfer_family_ = compute_family_;  // ВАЖНО: одна семья для всего
 
     VkFenceCreateInfo fenceInfo = {};
     fenceInfo.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
@@ -615,17 +593,19 @@ bool VulkanBackend::create_all_pipelines() {
 void VulkanBackend::allocate_buffer_pool() {
     VkDeviceSize poolSize = static_cast<VkDeviceSize>(config_.buffer_pool_size_mb) * 1024 * 1024;
     VkDeviceSize perBuffer = poolSize / config_.max_buffers;
-
     if (perBuffer < 65536) perBuffer = 65536;
     if (perBuffer > 256 * 1024 * 1024) perBuffer = 256 * 1024 * 1024;
 
-    buffer_pool_.resize(config_.max_buffers);
+    buffer_pool_.clear();
     for (uint32_t i = 0; i < config_.max_buffers; i++) {
-        GPUBuffer& buf = buffer_pool_[i].buffer;
+        buffer_pool_.emplace_back();
+        PoolEntry& entry = buffer_pool_.back();
+        GPUBuffer& buf = entry.buffer;
         buf.size = perBuffer;
         buf.is_device_local = true;
         buf.is_persistent = false;
         buf.mapped = nullptr;
+        entry.free = true;
 
         VkBufferCreateInfo bufferInfo = {};
         bufferInfo.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
@@ -642,12 +622,10 @@ void VulkanBackend::allocate_buffer_pool() {
 
         VkMemoryRequirements memReqs;
         vkGetBufferMemoryRequirements(device_, buf.buffer, &memReqs);
-
         VkMemoryAllocateInfo allocInfo = {};
         allocInfo.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
         allocInfo.allocationSize = memReqs.size;
-        allocInfo.memoryTypeIndex = find_memory_type(memReqs.memoryTypeBits,
-            VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+        allocInfo.memoryTypeIndex = find_memory_type(memReqs.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
 
         if (vkAllocateMemory(device_, &allocInfo, nullptr, &buf.memory) != VK_SUCCESS) {
             std::cerr << "VulkanBackend: Failed to allocate pool memory " << i << std::endl;
@@ -655,7 +633,6 @@ void VulkanBackend::allocate_buffer_pool() {
             buf.buffer = VK_NULL_HANDLE;
             continue;
         }
-
         vkBindBufferMemory(device_, buf.buffer, buf.memory, 0);
     }
 }
@@ -705,6 +682,51 @@ void VulkanBackend::allocate_staging_buffer() {
 GPUBuffer* VulkanBackend::allocate_buffer(size_t size, bool persistent) {
     std::lock_guard<std::mutex> lock(pool_mutex_);
 
+    VkDeviceSize perBuffer = (static_cast<VkDeviceSize>(config_.buffer_pool_size_mb) * 1024 * 1024) / config_.max_buffers;
+    if (size > perBuffer) {
+        buffer_pool_.emplace_back();
+        PoolEntry& entry = buffer_pool_.back();
+        GPUBuffer& buf = entry.buffer;
+        buf.size = size;
+        buf.is_device_local = true;
+        buf.is_persistent = persistent;
+        buf.mapped = nullptr;
+
+        VkBufferCreateInfo bufferInfo = {};
+        bufferInfo.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+        bufferInfo.size = size;
+        bufferInfo.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+                           VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
+                           VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+        bufferInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+
+        if (vkCreateBuffer(device_, &bufferInfo, nullptr, &buf.buffer) != VK_SUCCESS) {
+            buffer_pool_.pop_back();
+            return nullptr;
+        }
+
+        VkMemoryRequirements memReqs;
+        vkGetBufferMemoryRequirements(device_, buf.buffer, &memReqs);
+
+        VkMemoryAllocateInfo allocInfo = {};
+        allocInfo.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+        allocInfo.allocationSize = memReqs.size;
+        allocInfo.memoryTypeIndex = find_memory_type(memReqs.memoryTypeBits,
+            VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+
+        if (vkAllocateMemory(device_, &allocInfo, nullptr, &buf.memory) != VK_SUCCESS) {
+            vkDestroyBuffer(device_, buf.buffer, nullptr);
+            buffer_pool_.pop_back();
+            return nullptr;
+        }
+
+        vkBindBufferMemory(device_, buf.buffer, buf.memory, 0);
+        entry.free = false;
+        pool_total_ += size;
+        pool_used_ += size;
+        return &entry.buffer;
+    }
+
     for (auto& entry : buffer_pool_) {
         if (entry.free && entry.buffer.buffer != VK_NULL_HANDLE && entry.buffer.size >= size) {
             entry.free = false;
@@ -714,18 +736,26 @@ GPUBuffer* VulkanBackend::allocate_buffer(size_t size, bool persistent) {
         }
     }
 
-    std::cerr << "VulkanBackend: No free buffer for allocation of " << size << " bytes" << std::endl;
     return nullptr;
 }
 
 void VulkanBackend::free_buffer(GPUBuffer* buf) {
     if (!buf) return;
     std::lock_guard<std::mutex> lock(pool_mutex_);
+    VkDeviceSize perBuffer = (static_cast<VkDeviceSize>(config_.buffer_pool_size_mb) * 1024 * 1024) / config_.max_buffers;
 
-    for (auto& entry : buffer_pool_) {
-        if (&entry.buffer == buf) {
-            entry.free = true;
-            pool_used_ -= buf->size;
+    for (auto it = buffer_pool_.begin(); it != buffer_pool_.end(); ++it) {
+        if (&it->buffer == buf) {
+            if (buf->size > perBuffer) {
+                vkDestroyBuffer(device_, buf->buffer, nullptr);
+                vkFreeMemory(device_, buf->memory, nullptr);
+                pool_total_ -= buf->size;
+                pool_used_ -= buf->size;
+                buffer_pool_.erase(it);
+            } else {
+                it->free = true;
+                pool_used_ -= buf->size;
+            }
             return;
         }
     }
@@ -747,40 +777,21 @@ void VulkanBackend::upload_to_buffer(GPUBuffer* dst, const void* src, size_t siz
     beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
     beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
 
-    if (transfer_cmd_ != VK_NULL_HANDLE && transfer_cmd_pool_ != cmd_pool_) {
-        vkBeginCommandBuffer(transfer_cmd_, &beginInfo);
-        VkBufferCopy copyRegion = {};
-        copyRegion.srcOffset = 0;
-        copyRegion.dstOffset = 0;
-        copyRegion.size = size;
-        vkCmdCopyBuffer(transfer_cmd_, staging_buffer_.buffer, dst->buffer, 1, &copyRegion);
-        vkEndCommandBuffer(transfer_cmd_);
-
-        VkSubmitInfo submitInfo = {};
-        submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
-        submitInfo.commandBufferCount = 1;
-        submitInfo.pCommandBuffers = &transfer_cmd_;
-        vkResetFences(device_, 1, &transfer_fence_);
-        vkQueueSubmit(transfer_queue_, 1, &submitInfo, transfer_fence_);
-        vkWaitForFences(device_, 1, &transfer_fence_, VK_TRUE, UINT64_MAX);
-        vkResetCommandBuffer(transfer_cmd_, 0);
-    } else {
-        vkResetFences(device_, 1, &batch_fence_);
-        vkBeginCommandBuffer(current_cmd_, &beginInfo);
-        VkBufferCopy copyRegion = {};
-        copyRegion.srcOffset = 0;
-        copyRegion.dstOffset = 0;
-        copyRegion.size = size;
-        vkCmdCopyBuffer(current_cmd_, staging_buffer_.buffer, dst->buffer, 1, &copyRegion);
-        vkEndCommandBuffer(current_cmd_);
-        VkSubmitInfo submitInfo = {};
-        submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
-        submitInfo.commandBufferCount = 1;
-        submitInfo.pCommandBuffers = &current_cmd_;
-        vkQueueSubmit(compute_queue_, 1, &submitInfo, batch_fence_);
-        vkWaitForFences(device_, 1, &batch_fence_, VK_TRUE, UINT64_MAX);
-        vkResetCommandBuffer(current_cmd_, 0);
-    }
+    vkResetFences(device_, 1, &batch_fence_);
+    vkResetCommandBuffer(current_cmd_, 0);
+    vkBeginCommandBuffer(current_cmd_, &beginInfo);
+    VkBufferCopy copyRegion = {};
+    copyRegion.srcOffset = 0;
+    copyRegion.dstOffset = 0;
+    copyRegion.size = size;
+    vkCmdCopyBuffer(current_cmd_, staging_buffer_.buffer, dst->buffer, 1, &copyRegion);
+    vkEndCommandBuffer(current_cmd_);
+    VkSubmitInfo submitInfo = {};
+    submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+    submitInfo.commandBufferCount = 1;
+    submitInfo.pCommandBuffers = &current_cmd_;
+    vkQueueSubmit(compute_queue_, 1, &submitInfo, batch_fence_);
+    vkWaitForFences(device_, 1, &batch_fence_, VK_TRUE, UINT64_MAX);
 }
 
 void VulkanBackend::download_from_buffer(void* dst, GPUBuffer* src, size_t size) {
@@ -795,6 +806,7 @@ void VulkanBackend::download_from_buffer(void* dst, GPUBuffer* src, size_t size)
     beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
 
     vkResetFences(device_, 1, &batch_fence_);
+    vkResetCommandBuffer(current_cmd_, 0);
     vkBeginCommandBuffer(current_cmd_, &beginInfo);
     VkBufferCopy copyRegion = {};
     copyRegion.srcOffset = 0;
@@ -829,11 +841,11 @@ void VulkanBackend::upload_to_buffer_batched(GPUBuffer* dst, const void* src, si
 
 void VulkanBackend::download_from_buffer_batched(void* dst, GPUBuffer* src, size_t size) {
     if (!dst || !src || size == 0) return;
-        if (staging_used_ + size > staging_buffer_.size) {
-            std::cerr << "VulkanBackend: FATAL staging overflow " << (staging_used_ + size)
-                      << " > " << staging_buffer_.size << std::endl;
-            std::abort();
-        }
+    if (staging_used_ + size > staging_buffer_.size) {
+        std::cerr << "VulkanBackend: FATAL staging overflow " << (staging_used_ + size)
+                  << " > " << staging_buffer_.size << std::endl;
+        std::abort();
+    }
     ensure_batch_open();
     VkBufferMemoryBarrier b = {VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER};
     b.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
@@ -843,7 +855,7 @@ void VulkanBackend::download_from_buffer_batched(void* dst, GPUBuffer* src, size
         VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 1, &b, 0, nullptr);
     VkBufferCopy r = {}; r.dstOffset = staging_used_; r.size = size;
     vkCmdCopyBuffer(current_cmd_, src->buffer, staging_buffer_.buffer, 1, &r);
-    pending_downloads_.push_back({dst, size, staging_used_});
+    pending_downloads_.push_back({dst, size, {}});
     staging_used_ += size;
 }
 // ============================================================================
@@ -892,14 +904,19 @@ void VulkanBackend::end_batch() {
     }
 
     for (auto& dl : pending_downloads_) {
-        memcpy(dl.dst, (char*)staging_buffer_.mapped + dl.offset, dl.size);
+        dl.data.resize(dl.size);
+        memcpy(dl.data.data(), (char*)staging_buffer_.mapped + dl.offset, dl.size);
     }
     pending_downloads_.clear();
     staging_used_ = 0;
 
     vkResetCommandBuffer(current_cmd_, 0);
     batch_open_ = false;
-}
+
+    // Копируем данные в целевые указатели ПОСЛЕ очистки командного буфера
+    for (auto& dl : pending_downloads_) {
+        memcpy(dl.dst, dl.data.data(), dl.size);
+    }
 
 // ============================================================================
 // Выделение дескрипторного набора

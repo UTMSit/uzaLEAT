@@ -200,9 +200,11 @@ bool StreamingDataset::next(std::pair<std::string, std::string>& example) {
             if (line.front() != '{' || line.back() != '}') continue;
             std::string in = extract_value(line, current_input_key_);
             std::string out = extract_value(line, current_output_key_);
-            if (!in.empty() && !out.empty()) {
-                example = {in, out};
-                return true;
+            if (in.empty()) {
+                in = extract_value(line, "instruction");
+            } else {
+                std::string instr = extract_value(line, "instruction");
+                if (!instr.empty()) in = instr + " " + in;
             }
         }
         if (!open_next_file()) return false;
@@ -405,18 +407,20 @@ void UzaLEATCore::signal_handler(int) { interrupted_ = true; }
 
 UzaLEATCore::UzaLEATCore(const CoreConfig& config) : config_(config), model_so_{} {
     std::signal(SIGINT, signal_handler);
-#ifdef UZALEAT_USE_VULKAN
-    if (config_.use_gpu) {
-        vulkan_ = std::make_unique<uzagpt::VulkanBackend>();
-        if (!vulkan_->init()) {
-            std::cerr << "Vulkan init failed, falling back to CPU\n";
-            vulkan_.reset();
-            config_.use_gpu = false;
-        } else {
-            g_vk_global = std::move(vulkan_);
+    #ifdef UZALEAT_USE_VULKAN
+        if (config_.use_gpu) {
+            uzagpt::GPUConfig gpu_cfg;
+            gpu_cfg.staging_buffer_size_mb = 512;  // 512 МБ вместо 64
+            vulkan_ = std::make_unique<uzagpt::VulkanBackend>();
+            if (!vulkan_->init(gpu_cfg)) {
+                std::cerr << "Vulkan init failed, falling back to CPU\n";
+                vulkan_.reset();
+                config_.use_gpu = false;
+            } else {
+                g_vk_global = std::move(vulkan_);
+            }
         }
-    }
-#endif
+    #endif
 }
 
 UzaLEATCore::~UzaLEATCore() {
