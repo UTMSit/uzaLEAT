@@ -9,6 +9,7 @@
 #include <string>
 #include <memory>
 #include <mutex>
+#include <list>
 
 namespace uzagpt {
 
@@ -123,7 +124,7 @@ private:
         GPUBuffer buffer;
         bool free = true;
     };
-    std::vector<PoolEntry> buffer_pool_;
+    std::list<PoolEntry> buffer_pool_;
     std::mutex pool_mutex_;
     VkDeviceSize pool_total_ = 0;
     VkDeviceSize pool_used_ = 0;
@@ -132,7 +133,7 @@ private:
     struct PendingDownload {
         void* dst;
         size_t size;
-        size_t offset;
+        std::vector<char> data;  // владеет данными
     };
     std::vector<PendingDownload> pending_downloads_;
     size_t staging_used_ = 0;
