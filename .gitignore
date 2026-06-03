@@ -7,3 +7,4 @@ EVAngelion.cpp
 *.so
 *.gguf
 *.txt
+*.bin
