@@ -10,15 +10,8 @@
 #include <chrono>
 #include <filesystem>
 #include <csignal>
+#include <unordered_set>
 #include "vulkan_backend.hpp"
-
-#ifdef UZALEAT_USE_VULKAN
-extern std::unique_ptr<uzagpt::VulkanBackend> g_vk_global;
-#endif
-
-#ifdef _OPENMP
-#include <omp.h>
-#endif
 
 namespace uzaleat {
 
@@ -70,6 +63,10 @@ bool StreamingDataset::open_next_file() {
 }
 
 bool StreamingDataset::detect_keys_for_current_file() {
+    // Если ключи уже установлены явно (через set_keys или переменные окружения в конструкторе),
+    // не перезаписывать их авто-детектом
+    if (!current_input_key_.empty() && !current_output_key_.empty()) return true;
+
     std::vector<std::string> sample;
     std::string line;
     std::streampos start_pos = current_file_.tellg();
@@ -86,10 +83,6 @@ bool StreamingDataset::detect_keys_for_current_file() {
 }
 
 std::pair<std::string, std::string> StreamingDataset::detect_keys_from_sample(const std::vector<std::string>& sample) {
-    const char* env_in = std::getenv("UZALEAT_INPUT_KEY");
-    const char* env_out = std::getenv("UZALEAT_OUTPUT_KEY");
-    if (env_in && env_out) return {env_in, env_out};
-
     static const std::vector<std::string> input_candidates = {
         "input", "prompt", "question", "instruction", "text", "content",
         "message", "query", "context", "src", "source", "user", "human"
@@ -152,31 +145,6 @@ std::string StreamingDataset::extract_value(const std::string& json, const std::
     }
 }
 
-bool StreamingDataset::fill_buffer() {
-    if (!current_file_.is_open() && !open_next_file()) return false;
-    std::string line;
-    while (shuffle_pool_.size() < static_cast<size_t>(shuffle_buffer_)) {
-        if (!std::getline(current_file_, line)) {
-            if (!open_next_file()) break;
-            continue;
-        }
-        if (line.empty()) continue;
-        if (in_array_) {
-            if (line == "[") continue;
-            if (line == "]") { in_array_ = false; continue; }
-            if (line.back() == ',') line.pop_back();
-        } else if (line.front() == '[') {
-            in_array_ = true;
-            continue;
-        }
-        if (line.front() != '{' || line.back() != '}') continue;
-        std::string in = extract_value(line, current_input_key_);
-        std::string out = extract_value(line, current_output_key_);
-        if (!in.empty() && !out.empty()) shuffle_pool_.push({in, out});
-    }
-    return !shuffle_pool_.empty();
-}
-
 bool StreamingDataset::next(std::pair<std::string, std::string>& example) {
     std::lock_guard<std::mutex> lock(mutex_);
     while (true) {
@@ -201,14 +169,56 @@ bool StreamingDataset::next(std::pair<std::string, std::string>& example) {
             std::string in = extract_value(line, current_input_key_);
             std::string out = extract_value(line, current_output_key_);
             if (in.empty()) {
+                // fallback: попробовать "instruction" + "input"
                 in = extract_value(line, "instruction");
-            } else {
-                std::string instr = extract_value(line, "instruction");
-                if (!instr.empty()) in = instr + " " + in;
+                std::string inp = extract_value(line, "input");
+                if (!inp.empty()) {
+                    if (!in.empty()) in += " " + inp;
+                    else in = inp;
+                }
+            }
+            if (!in.empty() && !out.empty()) {
+                example = {in, out};
+                return true;
             }
         }
         if (!open_next_file()) return false;
     }
+}
+
+bool StreamingDataset::fill_buffer() {
+    if (!current_file_.is_open() && !open_next_file()) return false;
+    std::string line;
+    while (shuffle_pool_.size() < static_cast<size_t>(shuffle_buffer_)) {
+        if (!std::getline(current_file_, line)) {
+            if (!open_next_file()) break;
+            continue;
+        }
+        if (line.empty()) continue;
+        if (in_array_) {
+            if (line == "[") continue;
+            if (line == "]") { in_array_ = false; continue; }
+            if (line.back() == ',') line.pop_back();
+        } else if (line.front() == '[') {
+            in_array_ = true;
+            continue;
+        }
+        if (line.front() != '{' || line.back() != '}') continue;
+        std::string in = extract_value(line, current_input_key_);
+        std::string out = extract_value(line, current_output_key_);
+        if (in.empty()) {
+            in = extract_value(line, "instruction");
+            std::string inp = extract_value(line, "input");
+            if (!inp.empty()) {
+                if (!in.empty()) in += " " + inp;
+                else in = inp;
+            }
+        }
+        if (!in.empty() && !out.empty()) {
+            shuffle_pool_.push({in, out});
+        }
+    }
+    return !shuffle_pool_.empty();
 }
 
 void StreamingDataset::reset() {
@@ -220,7 +230,7 @@ void StreamingDataset::reset() {
 }
 
 // -------------------------------------------------------------------
-// Tokenizer
+// Tokenizer — UTF-8 aware BPE
 // -------------------------------------------------------------------
 Tokenizer::Tokenizer() {}
 
@@ -234,7 +244,16 @@ std::vector<std::string> Tokenizer::bpe(const std::string& token) {
     auto it = cache_.find(token);
     if (it != cache_.end()) return it->second;
     std::vector<std::string> word;
-    for (char c : token) word.push_back(std::string(1, c));
+    // Разбиваем на UTF-8 символы, а не байты
+    for (size_t i = 0; i < token.size(); ) {
+        unsigned char c = token[i];
+        int len = 1;
+        if ((c & 0xE0) == 0xC0) len = 2;
+        else if ((c & 0xF0) == 0xE0) len = 3;
+        else if ((c & 0xF8) == 0xF0) len = 4;
+        word.push_back(token.substr(i, len));
+        i += len;
+    }
     while (word.size() > 1) {
         std::string best_pair;
         int best_rank = INT_MAX;
@@ -266,25 +285,47 @@ std::vector<std::string> Tokenizer::bpe(const std::string& token) {
 }
 
 void Tokenizer::train(const std::vector<std::string>& texts, int num_merges) {
+    // Собираем слова с UTF-8 aware разбивкой
     std::unordered_map<std::string, int> word_freq;
     for (const auto& text : texts) {
-        std::string word;
-        for (char c : text) {
-            if (std::isalnum(static_cast<unsigned char>(c))) {
-                word += c;
+        std::string current_word;
+        for (size_t i = 0; i < text.size(); ) {
+            unsigned char c = text[i];
+            int len = 1;
+            if ((c & 0xE0) == 0xC0) len = 2;
+            else if ((c & 0xF0) == 0xE0) len = 3;
+            else if ((c & 0xF8) == 0xF0) len = 4;
+
+            std::string ch = text.substr(i, len);
+            bool is_word_char = (len > 1) || std::isalnum(c) || c == '_';
+
+            if (is_word_char) {
+                current_word += ch;
             } else {
-                if (!word.empty()) { word_freq[word]++; word.clear(); }
-                word_freq[std::string(1, c)]++;
+                if (!current_word.empty()) { word_freq[current_word]++; current_word.clear(); }
+                word_freq[ch]++;
             }
+            i += len;
         }
-        if (!word.empty()) word_freq[word]++;
+        if (!current_word.empty()) word_freq[current_word]++;
     }
+
+    // Начальные символы — UTF-8 aware
     std::vector<std::pair<std::vector<std::string>, int>> word_symbols;
     for (const auto& [w, freq] : word_freq) {
         std::vector<std::string> symbols;
-        for (char c : w) symbols.push_back(std::string(1, c));
+        for (size_t i = 0; i < w.size(); ) {
+            unsigned char c = w[i];
+            int len = 1;
+            if ((c & 0xE0) == 0xC0) len = 2;
+            else if ((c & 0xF0) == 0xE0) len = 3;
+            else if ((c & 0xF8) == 0xF0) len = 4;
+            symbols.push_back(w.substr(i, len));
+            i += len;
+        }
         word_symbols.emplace_back(symbols, freq);
     }
+
     merges_.clear();
     for (int merge = 0; merge < num_merges; ++merge) {
         std::unordered_map<std::string, int> pair_freq;
@@ -314,14 +355,17 @@ void Tokenizer::train(const std::vector<std::string>& texts, int num_merges) {
             syms = std::move(new_syms);
         }
     }
+
     encoder_.clear(); decoder_.clear();
     int idx = 0;
+    // 256 байтовых токенов как fallback
     for (int i = 0; i < 256; ++i) {
         std::string s(1, static_cast<char>(i));
         encoder_[s] = idx;
         decoder_[idx] = s;
         ++idx;
     }
+    // Добавляем все merge-результаты
     for (const auto& m : merges_) {
         std::string merged = m.first + m.second;
         if (encoder_.find(merged) == encoder_.end()) {
@@ -334,10 +378,29 @@ void Tokenizer::train(const std::vector<std::string>& texts, int num_merges) {
 
 std::vector<int> Tokenizer::encode(const std::string& text) {
     std::vector<int> tokens;
-    for (char c : text) {
-        auto it = encoder_.find(std::string(1, c));
-        if (it != encoder_.end()) tokens.push_back(it->second);
+    // Разбиваем на UTF-8 символы
+    for (size_t i = 0; i < text.size(); ) {
+        unsigned char c = text[i];
+        int len = 1;
+        if ((c & 0xE0) == 0xC0) len = 2;
+        else if ((c & 0xF0) == 0xE0) len = 3;
+        else if ((c & 0xF8) == 0xF0) len = 4;
+
+        std::string ch = text.substr(i, len);
+        auto it = encoder_.find(ch);
+        if (it != encoder_.end()) {
+            tokens.push_back(it->second);
+        } else {
+            // Fallback: побайтово
+            for (int j = 0; j < len; ++j) {
+                std::string byte(1, text[i+j]);
+                auto it2 = encoder_.find(byte);
+                if (it2 != encoder_.end()) tokens.push_back(it2->second);
+            }
+        }
+        i += len;
     }
+    // BPE слияние
     bool changed = true;
     while (changed && tokens.size() > 1) {
         changed = false;
@@ -410,21 +473,33 @@ UzaLEATCore::UzaLEATCore(const CoreConfig& config) : config_(config), model_so_{
     #ifdef UZALEAT_USE_VULKAN
         if (config_.use_gpu) {
             uzagpt::GPUConfig gpu_cfg;
-            gpu_cfg.staging_buffer_size_mb = 512;  // 512 МБ вместо 64
+            gpu_cfg.staging_buffer_size_mb = 512;
             vulkan_ = std::make_unique<uzagpt::VulkanBackend>();
             if (!vulkan_->init(gpu_cfg)) {
                 std::cerr << "Vulkan init failed, falling back to CPU\n";
                 vulkan_.reset();
                 config_.use_gpu = false;
             } else {
-                g_vk_global = std::move(vulkan_);
+                g_vk_global = vulkan_.get();
             }
         }
     #endif
 }
 
 UzaLEATCore::~UzaLEATCore() {
-    if (model_so_.handle) dlclose(model_so_.handle);
+    // Сначала выгружаем .so (статические данные плагина теряют доступ к GPU)
+    if (model_so_.handle) {
+        dlclose(model_so_.handle);
+        model_so_.handle = nullptr;
+    }
+    // Потом выключаем Vulkan
+    #ifdef UZALEAT_USE_VULKAN
+        if (vulkan_) {
+            vulkan_->shutdown();
+            vulkan_.reset();
+            g_vk_global = nullptr;
+        }
+    #endif
 }
 
 bool UzaLEATCore::load_model_so(const std::string& path) {
@@ -474,7 +549,15 @@ bool UzaLEATCore::prepare_tokenizer() {
             std::cerr << "Failed to load tokenizer: " << e.what() << ", will train from data\n";
         }
     }
+    // Принудительно установить ключи из переменных окружения
     StreamingDataset sample_ds(config_.data_path, 0);
+    const char* env_in = std::getenv("UZALEAT_INPUT_KEY");
+    const char* env_out = std::getenv("UZALEAT_OUTPUT_KEY");
+    if (env_in && env_out) {
+        sample_ds.current_input_key_ = env_in;
+        sample_ds.current_output_key_ = env_out;
+        sample_ds.reset();
+    }
     std::vector<std::string> texts;
     std::pair<std::string, std::string> ex;
     int count = 0;
@@ -588,6 +671,12 @@ void UzaLEATCore::train() {
     if (use_so) model_so_.save(final_path.c_str());
     else program_.save(final_path);
     std::cout << "Training complete. Model saved to " << final_path << std::endl;
+
+    // Очистить GPU-буферы плагина
+    if (use_so && model_so_.handle) {
+        auto cleanup = (void (*)()) dlsym(model_so_.handle, "model_cleanup");
+        if (cleanup) cleanup();
+    }
 }
 
 void UzaLEATCore::chat() {

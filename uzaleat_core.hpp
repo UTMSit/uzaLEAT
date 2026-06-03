@@ -70,13 +70,18 @@ public:
     StreamingDataset(const std::string& path, int shuffle_buffer);
     bool next(std::pair<std::string, std::string>& example);
     void reset();
+    void set_keys(const std::string& in, const std::string& out) {
+        current_input_key_ = in;
+        current_output_key_ = out;
+    }
 
+public:
+    std::string current_input_key_;
+    std::string current_output_key_;
 private:
     std::vector<std::string> files_;
     size_t current_file_idx_ = 0;
     std::ifstream current_file_;
-    std::string current_input_key_;
-    std::string current_output_key_;
     bool in_array_ = false;
     int shuffle_buffer_;
     std::queue<std::pair<std::string, std::string>> shuffle_pool_;

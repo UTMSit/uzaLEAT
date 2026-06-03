@@ -17,7 +17,7 @@
 #include <vector>
 #include <string>
 
-std::unique_ptr<uzagpt::VulkanBackend> g_vk_global;
+uzagpt::VulkanBackend* g_vk_global = nullptr;
 
 namespace uzagpt {
 
@@ -132,6 +132,19 @@ void VulkanBackend::shutdown() {
     if (device_ == VK_NULL_HANDLE) return;
     vkDeviceWaitIdle(device_);
 
+    // 0. Очистить пул буферов
+    for (auto& entry : buffer_pool_) {
+        if (entry.buffer.buffer != VK_NULL_HANDLE) {
+            vkDestroyBuffer(device_, entry.buffer.buffer, nullptr);
+            entry.buffer.buffer = VK_NULL_HANDLE;
+        }
+        if (entry.buffer.memory != VK_NULL_HANDLE) {
+            vkFreeMemory(device_, entry.buffer.memory, nullptr);
+            entry.buffer.memory = VK_NULL_HANDLE;
+        }
+    }
+    buffer_pool_.clear();
+
     // 1. Удалить staging
     if (staging_buffer_.buffer != VK_NULL_HANDLE) {
         vkDestroyBuffer(device_, staging_buffer_.buffer, nullptr);
@@ -142,7 +155,7 @@ void VulkanBackend::shutdown() {
         staging_buffer_.memory = VK_NULL_HANDLE;
     }
 
-    // 2. Пайплайны ПЕРЕД device
+    // 2. Пайплайны
     auto destroyPipeline = [this](VkPipeline& p) {
         if (p != VK_NULL_HANDLE) { vkDestroyPipeline(device_, p, nullptr); p = VK_NULL_HANDLE; }
     };
@@ -164,15 +177,12 @@ void VulkanBackend::shutdown() {
     if (transfer_fence_ != VK_NULL_HANDLE) { vkDestroyFence(device_, transfer_fence_, nullptr); transfer_fence_ = VK_NULL_HANDLE; }
     if (cmd_pool_ != VK_NULL_HANDLE) { vkDestroyCommandPool(device_, cmd_pool_, nullptr); cmd_pool_ = VK_NULL_HANDLE; }
 
-    // 3. device
     vkDestroyDevice(device_, nullptr);
     device_ = VK_NULL_HANDLE;
 
-    // 4. instance
     vkDestroyInstance(instance_, nullptr);
     instance_ = VK_NULL_HANDLE;
 
-    // 5. Остальные поля
     physical_device_ = VK_NULL_HANDLE;
     compute_queue_ = VK_NULL_HANDLE;
     transfer_queue_ = VK_NULL_HANDLE;
@@ -855,7 +865,12 @@ void VulkanBackend::download_from_buffer_batched(void* dst, GPUBuffer* src, size
         VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 1, &b, 0, nullptr);
     VkBufferCopy r = {}; r.dstOffset = staging_used_; r.size = size;
     vkCmdCopyBuffer(current_cmd_, src->buffer, staging_buffer_.buffer, 1, &r);
-    pending_downloads_.push_back({dst, size, {}});
+    PendingDownload pd;
+    pd.dst = nullptr;
+    pd.size = size;
+    pd.offset = staging_used_;
+    pd.data.resize(size);
+    pending_downloads_.push_back(std::move(pd));
     staging_used_ += size;
 }
 // ============================================================================
@@ -904,19 +919,18 @@ void VulkanBackend::end_batch() {
     }
 
     for (auto& dl : pending_downloads_) {
-        dl.data.resize(dl.size);
-        memcpy(dl.data.data(), (char*)staging_buffer_.mapped + dl.offset, dl.size);
+        if (!dl.data.empty()) {
+            memcpy(dl.data.data(), (char*)staging_buffer_.mapped + dl.offset, dl.size);
+        } else if (dl.dst) {
+            memcpy(dl.dst, (char*)staging_buffer_.mapped + dl.offset, dl.size);
+        }
     }
     pending_downloads_.clear();
     staging_used_ = 0;
 
     vkResetCommandBuffer(current_cmd_, 0);
     batch_open_ = false;
-
-    // Копируем данные в целевые указатели ПОСЛЕ очистки командного буфера
-    for (auto& dl : pending_downloads_) {
-        memcpy(dl.dst, dl.data.data(), dl.size);
-    }
+}
 
 // ============================================================================
 // Выделение дескрипторного набора

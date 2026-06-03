@@ -133,7 +133,8 @@ private:
     struct PendingDownload {
         void* dst;
         size_t size;
-        std::vector<char> data;  // владеет данными
+        size_t offset;
+        std::vector<char> data;
     };
     std::vector<PendingDownload> pending_downloads_;
     size_t staging_used_ = 0;
@@ -184,3 +185,6 @@ private:
 };
 
 } // namespace uzagpt
+
+// Глобальный указатель на Vulkan-бэкенд (сырой, владение у UzaLEATCore)
+extern uzagpt::VulkanBackend* g_vk_global;

@@ -3,6 +3,7 @@ uzaLEAT
 *.gutr
 *.bin
 slesa_flettohm.cpp
+EVAngelion.cpp
 *.so
 *.gguf
 *.txt
