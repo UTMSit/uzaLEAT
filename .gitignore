@@ -8,3 +8,4 @@ EVAngelion.cpp
 *.gguf
 *.txt
 *.bin
+*.jsonl
