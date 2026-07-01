@@ -1,0 +1,136 @@
+// ============================================================================
+// shaders/attention.comp
+// Flash Attention для одного токена с KV кэшем
+// Workgroup: 1D (256 потоков) на голову attention
+// ============================================================================
+#version 450
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) readonly buffer Q { float q[]; };
+layout(set = 0, binding = 1) readonly buffer KCache { float k_cache[]; };
+layout(set = 0, binding = 2) readonly buffer VCache { float v_cache[]; };
+layout(set = 0, binding = 3) writeonly buffer Out { float out_data[]; };
+
+layout(push_constant) uniform Params {
+    uint pos;
+    uint seq_len;
+    uint num_heads;
+    uint head_dim;
+} pc;
+
+shared float shared_scores[256];
+shared float shared_max[256];
+shared float shared_sum[256];
+shared float shared_acc[256];
+
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+    uint head = gl_WorkGroupID.x;
+
+    if (head >= pc.num_heads) return;
+
+    uint seq_len_actual = pc.pos + 1;
+    float scale = 1.0 / sqrt(float(pc.head_dim));
+
+    // ================================================================
+    // 1. Вычисляем scores = q @ K_cache^T для ВСЕХ позиций
+    // ================================================================
+
+    // Массив scores для всех позиций (временное хранилище в shared memory)
+    // Но 256 потоков * 256 позиций = 64KB shared memory — влезает
+    #define MAX_SEQ 256
+    float scores[MAX_SEQ];
+
+    for (uint t = 0; t < seq_len_actual; t++) {
+        float score = 0.0;
+
+        // Каждый поток считает одну размерность head_dim
+        uint k_offset = t * pc.num_heads * pc.head_dim + head * pc.head_dim;
+        for (uint d = tid; d < pc.head_dim; d += 256) {
+            score += q[head * pc.head_dim + d] * k_cache[k_offset + d];
+        }
+
+        // Редукция по потокам внутри workgroup
+        shared_scores[tid] = score;
+        barrier();
+
+        for (uint stride = 128; stride > 0; stride >>= 1) {
+            if (tid < stride) {
+                shared_scores[tid] += shared_scores[tid + stride];
+            }
+            barrier();
+        }
+
+        if (tid == 0) {
+            scores[t] = shared_scores[0] * scale;
+        }
+        barrier();
+    }
+
+    // ================================================================
+    // 2. Softmax (online stable softmax)
+    // ================================================================
+    float max_val = -1e30;
+    float sum_exp = 0.0;
+
+    for (uint t = tid; t < seq_len_actual; t += 256) {
+        max_val = max(max_val, scores[t]);
+    }
+
+    shared_max[tid] = max_val;
+    barrier();
+
+    for (uint stride = 128; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            shared_max[tid] = max(shared_max[tid], shared_max[tid + stride]);
+        }
+        barrier();
+    }
+
+    float global_max = shared_max[0];
+
+    for (uint t = tid; t < seq_len_actual; t += 256) {
+        float exp_val = exp(scores[t] - global_max);
+        scores[t] = exp_val;
+        sum_exp += exp_val;
+    }
+
+    shared_sum[tid] = sum_exp;
+    barrier();
+
+    for (uint stride = 128; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            shared_sum[tid] += shared_sum[tid + stride];
+        }
+        barrier();
+    }
+
+    float inv_sum = 1.0 / (shared_sum[0] + 1e-8);
+
+    for (uint t = tid; t < seq_len_actual; t += 256) {
+        scores[t] *= inv_sum;
+    }
+    barrier();
+
+    // ================================================================
+    // 3. Вычисляем out = scores @ V_cache
+    // ================================================================
+    float acc = 0.0;
+
+    for (uint d = tid; d < pc.head_dim; d += 256) {
+        float weighted_sum = 0.0;
+        for (uint t = 0; t < seq_len_actual; t++) {
+            uint v_offset = t * pc.num_heads * pc.head_dim + head * pc.head_dim + d;
+            weighted_sum += scores[t] * v_cache[v_offset];
+        }
+        if (tid == d % 256) {
+            shared_acc[tid] = weighted_sum;
+        }
+    }
+    barrier();
+
+    // Собираем результат
+    for (uint d = tid; d < pc.head_dim; d += 256) {
+        out_data[head * pc.head_dim + d] = shared_acc[d];
+    }
+}

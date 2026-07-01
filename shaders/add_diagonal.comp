@@ -1,0 +1,21 @@
+// ============================================================================
+// shaders/add_diagonal.comp
+// Добавление lambda к диагонали матрицы
+// Workgroup: 64
+// ============================================================================
+#version 450
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) buffer Mat { float mat_data[]; };
+
+layout(push_constant) uniform Params {
+    uint size;
+    float lambda;
+} pc;
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= pc.size) return;
+
+    mat_data[i * pc.size + i] += pc.lambda;
+}

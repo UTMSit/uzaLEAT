@@ -1,0 +1,46 @@
+// ============================================================================
+// shaders/fused_qkv.comp
+// Fused QKV projection: q = x @ Wq, k = x @ Wk, v = x @ Wv
+// Workgroup: 256
+// ============================================================================
+#version 450
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) readonly buffer X { float x_data[]; };
+layout(set = 0, binding = 1) readonly buffer QProj { float q_proj_data[]; };
+layout(set = 0, binding = 2) readonly buffer KProj { float k_proj_data[]; };
+layout(set = 0, binding = 3) readonly buffer VProj { float v_proj_data[]; };
+layout(set = 0, binding = 4) writeonly buffer Q { float q_out[]; };
+layout(set = 0, binding = 5) writeonly buffer K { float k_out[]; };
+layout(set = 0, binding = 6) writeonly buffer V { float v_out[]; };
+
+layout(push_constant) uniform Params {
+    uint d_model;
+} pc;
+
+shared float shared_x[256];
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= pc.d_model) return;
+
+    // Загружаем x в shared memory для быстрого доступа
+    uint tid = gl_LocalInvocationID.x;
+    shared_x[tid] = x_data[i];
+    barrier();
+
+    float q_sum = 0.0;
+    float k_sum = 0.0;
+    float v_sum = 0.0;
+
+    for (uint j = 0; j < pc.d_model; j++) {
+        float xj = shared_x[j % 256];
+        q_sum += xj * q_proj_data[j * pc.d_model + i];
+        k_sum += xj * k_proj_data[j * pc.d_model + i];
+        v_sum += xj * v_proj_data[j * pc.d_model + i];
+    }
+
+    q_out[i] = q_sum;
+    k_out[i] = k_sum;
+    v_out[i] = v_sum;
+}

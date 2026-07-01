@@ -1,0 +1,22 @@
+// ============================================================================
+// shaders/extract_row.comp
+// Извлечение строки из матрицы
+// Workgroup: 256
+// ============================================================================
+#version 450
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) readonly buffer Mat { float mat_data[]; };
+layout(set = 0, binding = 1) writeonly buffer Out { float out_data[]; };
+
+layout(push_constant) uniform Params {
+    uint row;
+    uint cols;
+} pc;
+
+void main() {
+    uint col = gl_GlobalInvocationID.x;
+    if (col >= pc.cols) return;
+
+    out_data[col] = mat_data[pc.row * pc.cols + col];
+}
