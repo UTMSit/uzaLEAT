@@ -3,14 +3,39 @@ CXX = g++
 CXXFLAGS = -std=c++17 -O3 -march=native -mtune=native -fopenmp -fPIC -Wall -Wextra -I.
 LDFLAGS = -lpthread -ldl -fopenmp -rdynamic
 
-# Vulkan SDK
-VULKAN_SDK ?= $(shell echo $$VULKAN_SDK)
-ifneq ($(VULKAN_SDK),)
-    VULKAN_INC = -I$(VULKAN_SDK)/include
-    VULKAN_LIB = -L$(VULKAN_SDK)/lib
-    CXXFLAGS += -DUZALEAT_USE_VULKAN $(VULKAN_INC)
-    LDFLAGS += $(VULKAN_LIB) -lvulkan
+# --- Vulkan detection ---------------------------------------------------------
+# Приоритет: 1) pkg-config, 2) VULKAN_SDK env, 3) CPATH (NixOS)
+HAS_VULKAN := 0
+VULKAN_CFLAGS :=
+VULKAN_LIBS :=
+
+# 1) pkg-config
+VULKAN_PC := $(shell pkg-config --cflags --libs vulkan 2>/dev/null)
+ifneq ($(VULKAN_PC),)
+    HAS_VULKAN := 1
+    VULKAN_CFLAGS += -DUZALEAT_USE_VULKAN
+    VULKAN_CFLAGS += $(shell pkg-config --cflags vulkan)
+    VULKAN_LIBS += $(shell pkg-config --libs vulkan)
+else
+    # 2) VULKAN_SDK
+    VULKAN_SDK_VAL ?= $(shell echo $$VULKAN_SDK)
+    ifneq ($(VULKAN_SDK_VAL),)
+        HAS_VULKAN := 1
+        VULKAN_CFLAGS += -DUZALEAT_USE_VULKAN -I$(VULKAN_SDK_VAL)/include
+        VULKAN_LIBS += -L$(VULKAN_SDK_VAL)/lib -lvulkan
+    else
+        # 3) CPATH / header check
+        VULKAN_TEST := $(shell echo '\#include <vulkan/vulkan.h>' | $(CXX) -x c++ -E - 2>/dev/null && echo 1)
+        ifeq ($(VULKAN_TEST),1)
+            HAS_VULKAN := 1
+            VULKAN_CFLAGS += -DUZALEAT_USE_VULKAN
+            VULKAN_LIBS += -lvulkan
+        endif
+    endif
 endif
+
+CXXFLAGS += $(VULKAN_CFLAGS)
+LDFLAGS += $(VULKAN_LIBS)
 
 # Компилятор шейдеров
 GLSLC = glslc
@@ -24,14 +49,18 @@ SHADER_OUTS = $(addprefix $(SHADER_DIR)/, $(addsuffix .spv, $(SHADERS_BASE)))
 
 # Исходники основного проекта
 SRCS = main.cpp uzaleat_core.cpp gutr_parser.cpp gutr_vm.cpp
-ifneq ($(VULKAN_SDK),)
+ifeq ($(HAS_VULKAN),1)
     SRCS += vulkan_backend.cpp
 endif
 OBJS = $(SRCS:.cpp=.o)
 
-# Модель .so
+# Модель .so — собирается и без Vulkan (только CPU)
 MODEL_SO = libslesa.so
 MODEL_SRCS = slesa_flettohm.cpp
+MODEL_OBJS = slesa_flettohm.o
+ifeq ($(HAS_VULKAN),1)
+    MODEL_OBJS += vulkan_backend.o
+endif
 
 TARGET = uzaLEAT
 
@@ -58,14 +87,17 @@ $(SHADER_DIR)/%.spv: $(SHADER_DIR)/%.comp
 # Модель .so
 model: shaders $(MODEL_SO)
 
-$(MODEL_SO): $(MODEL_SRCS) vulkan_backend.o
-	$(CXX) $(CXXFLAGS) -fPIC -shared -o $@ $^ \
-		$(LDFLAGS) $(shell pkg-config --libs vulkan 2>/dev/null || echo "-lvulkan")
+$(MODEL_SO): $(MODEL_OBJS)
+	$(CXX) $(CXXFLAGS) -fPIC -shared -o $@ $^ $(LDFLAGS)
 
-# vulkan_backend.o — всегда с PIC и UZALEAT_USE_VULKAN
+# vulkan_backend.o — только при доступном Vulkan SDK
 vulkan_backend.o: vulkan_backend.cpp vulkan_backend.hpp
-	$(CXX) -std=c++17 -O3 -fopenmp -fPIC -DUZALEAT_USE_VULKAN -I. -c vulkan_backend.cpp -o vulkan_backend.o
+ifeq ($(HAS_VULKAN),1)
+	$(CXX) $(CXXFLAGS) $(VULKAN_CFLAGS) -c $< -o $@
+else
+	@echo "Vulkan not available, skipping $@"
+endif
 
 clean:
-	rm -f $(OBJS) vulkan_backend.o $(TARGET) $(MODEL_SO)
+	rm -f $(OBJS) vulkan_backend.o $(TARGET) $(MODEL_SO) slesa_flettohm.o
 	rm -f $(SHADER_OUTS)

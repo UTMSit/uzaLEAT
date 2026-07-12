@@ -1,4 +1,5 @@
 uzaLEAT
+uzaLEAT*
 *.o
 *.gutr
 *.bin
@@ -9,3 +10,4 @@ EVAngelion.cpp
 *.txt
 *.bin
 *.jsonl
+*.log

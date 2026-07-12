@@ -3,7 +3,9 @@
 // ============================================================================
 #pragma once
 
+#ifdef UZALEAT_USE_VULKAN
 #include <vulkan/vulkan.h>
+#endif
 #include <vector>
 #include <unordered_map>
 #include <string>

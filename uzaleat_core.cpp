@@ -11,7 +11,9 @@
 #include <filesystem>
 #include <csignal>
 #include <unordered_set>
+#ifdef UZALEAT_USE_VULKAN
 #include "vulkan_backend.hpp"
+#endif
 
 namespace uzaleat {
 
@@ -63,8 +65,6 @@ bool StreamingDataset::open_next_file() {
 }
 
 bool StreamingDataset::detect_keys_for_current_file() {
-    // Если ключи уже установлены явно (через set_keys или переменные окружения в конструкторе),
-    // не перезаписывать их авто-детектом
     if (!current_input_key_.empty() && !current_output_key_.empty()) return true;
 
     std::vector<std::string> sample;
@@ -597,35 +597,45 @@ void UzaLEATCore::train() {
             model_so_.init(config_.hidden_size, config_.num_layers, config_.vocab_size,
                            config_.context_size, config_.tt_rank, config_.num_experts,
                            config_.window_size, config_.update_interval);
-        } if (use_so && model_so_.load_holdout) {
-            std::ifstream hf("holdout.jsonl");
-            if (hf.good()) {
-                hf.close();
-                model_so_.load_holdout("holdout.jsonl");
+            if (use_so) {
+                if (model_so_.load_holdout) {
+                    std::ifstream hf("holdout.jsonl");
+                    if (hf.good()) {
+                        hf.close();
+                        model_so_.load_holdout("holdout.jsonl");
+                        std::cout << "Loaded holdout.jsonl for validation gating\n";
+                    }
+                }
             }
         } else if (use_gutr) {
-        if (!load_plugin()) return;
-        program_.set_global("H", GUTRValue::integer(config_.hidden_size));
-        program_.set_global("L", GUTRValue::integer(config_.num_layers));
-        program_.set_global("V", GUTRValue::integer(config_.vocab_size));
-        program_.set_global("ctx_len", GUTRValue::integer(config_.context_size));
-        program_.set_global("tt_rank", GUTRValue::integer(config_.tt_rank));
-        program_.set_global("proj_rank", GUTRValue::integer(config_.proj_rank));
-        program_.set_global("update_interval", GUTRValue::integer(config_.update_interval));
-        program_.set_global("num_experts", GUTRValue::integer(config_.num_experts));
-        program_.set_global("window_size", GUTRValue::integer(config_.window_size));
-        program_.init("{}");
-    } else {
-        std::cerr << "Error: need --plugin or --model-so\n";
-        return;
+            if (!load_plugin()) return;
+            program_.set_global("H", GUTRValue::integer(config_.hidden_size));
+            program_.set_global("L", GUTRValue::integer(config_.num_layers));
+            program_.set_global("V", GUTRValue::integer(config_.vocab_size));
+            program_.set_global("ctx_len", GUTRValue::integer(config_.context_size));
+            program_.set_global("tt_rank", GUTRValue::integer(config_.tt_rank));
+            program_.set_global("proj_rank", GUTRValue::integer(config_.proj_rank));
+            program_.set_global("update_interval", GUTRValue::integer(config_.update_interval));
+            program_.set_global("num_experts", GUTRValue::integer(config_.num_experts));
+            program_.set_global("window_size", GUTRValue::integer(config_.window_size));
+            program_.init("{}");
+        } else {
+            std::cerr << "Error: need --plugin or --model-so\n";
+            return;
         }
     }
 
     StreamingDataset dataset(config_.data_path, config_.shuffle_buffer);
     size_t step = 0;
-    for (int epoch = 0; epoch < config_.epochs; ++epoch) {
+    double epoch_loss_sum = 0.0;
+    int epoch_token_count = 0;
+    // FLETTOHM v2.4: макс 40 эпох
+    int max_epochs = std::min(config_.epochs, 40);
+    for (int epoch = 0; epoch < max_epochs; ++epoch) {
         dataset.reset();
         int steps = 0;
+        epoch_loss_sum = 0.0;
+        epoch_token_count = 0;
         std::pair<std::string, std::string> ex;
         while (dataset.next(ex)) {
             if (interrupted_) {
@@ -635,42 +645,107 @@ void UzaLEATCore::train() {
                 else program_.save(save_path);
                 return;
             }
-            auto inp = tokenizer_.encode(ex.first);
-            auto tgt = tokenizer_.encode(ex.second);
-            if (inp.empty() || tgt.empty()) continue;
-            size_t seq_len = std::min({inp.size(), tgt.size(), config_.context_size});
-            inp.resize(seq_len);
-            tgt.resize(seq_len);
+            auto inp_tok = tokenizer_.encode(ex.first);
+            auto out_tok = tokenizer_.encode(ex.second);
+            if (inp_tok.empty() || out_tok.empty()) continue;
 
-            if (use_so)
-                model_so_.train_step(inp.data(), tgt.data(), seq_len, config_.learning_rate);
-            else
-                program_.train_step(inp, tgt, config_.learning_rate);
+            // Next-token prediction: конкатенируем вопрос + ответ,
+            // inp = tokens[0..n-1], tgt = tokens[1..n]
+            std::vector<int> full_tok;
+            full_tok.reserve(inp_tok.size() + out_tok.size());
+            full_tok.insert(full_tok.end(), inp_tok.begin(), inp_tok.end());
+            full_tok.insert(full_tok.end(), out_tok.begin(), out_tok.end());
 
-            ++steps; ++step;
-            if (steps % 10 == 0)
-                std::cout << "\rEpoch " << epoch+1 << " Step " << steps << std::flush;
+            if (full_tok.size() < 2) continue;
+            size_t seq_len = std::min(full_tok.size() - 1, config_.context_size);
+
+            std::vector<int> inp(seq_len), tgt(seq_len);
+            for (size_t i = 0; i < seq_len; ++i) {
+                inp[i] = full_tok[i];
+                tgt[i] = full_tok[i + 1];
+            }
+
+            float step_loss = 0.0f;
+                if (use_so) {
+                    step_loss = model_so_.train_step(inp.data(), tgt.data(), seq_len, config_.learning_rate);
+                } else {
+                    program_.train_step(inp, tgt, config_.learning_rate);
+                }
+
+                ++steps; ++step;
+                if (step_loss < 100.0f) {  // sanity check: reject huge loss spikes
+                    epoch_loss_sum += step_loss * seq_len;
+                    epoch_token_count += seq_len;
+                }
 
             if (step % config_.sample_every == 0) {
                 std::vector<int> gen(config_.max_tokens_sample);
                 int len;
                 if (use_so)
-                    len = model_so_.generate(inp.data(), inp.size(), gen.data(), config_.max_tokens_sample,
+                    len = model_so_.generate(inp_tok.data(), inp_tok.size(), gen.data(), config_.max_tokens_sample,
                                             config_.temperature, config_.top_p);
                 else
-                    len = program_.generate(inp, gen, config_.max_tokens_sample, config_.temperature, config_.top_p);
-                std::cout << "\n[Sample] " << tokenizer_.decode(std::vector<int>(gen.begin(), gen.begin()+len)) << "\n";
+                    len = program_.generate(inp_tok, gen, config_.max_tokens_sample, config_.temperature, config_.top_p);
+                std::string decoded = tokenizer_.decode(std::vector<int>(gen.begin(), gen.begin()+len));
+                // Clean up non-printable for display
+                std::string clean;
+                for (char c : decoded) {
+                    if (c >= 32 && c < 127) clean += c;
+                    else if (c == '\n') clean += "\\n";
+                }
+                std::cout << "\n[Sample] \"" << ex.first << "\" -> \"" << clean << "\"\n";
+                std::cout << "[Sample]   inp_tok=";
+                for (int t : inp_tok) std::cout << t << ",";
+                std::cout << " gen_tok=";
+                for (int i = 0; i < len; ++i) std::cout << gen[i] << ",";
+                std::cout << std::endl;
             }
         }
-        std::cout << "\nEpoch " << epoch+1 << " done.\n";
-        std::string ckpt = "checkpoint_epoch_" + std::to_string(epoch+1) + ".gguf";
-        if (use_so) model_so_.save(ckpt.c_str());
-        else program_.save(ckpt);
+        float epoch_avg_loss = epoch_token_count > 0 ? (float)(epoch_loss_sum / epoch_token_count) : 0.0f;
+        float epoch_ppl = std::exp(epoch_avg_loss);
+        std::cout << "\n>>> Epoch " << epoch+1 << "/" << max_epochs
+                  << " done | AvgLoss: " << std::fixed << std::setprecision(4) << epoch_avg_loss
+                  << " | PPL: " << std::setprecision(2) << epoch_ppl
+                  << " | Tokens: " << epoch_token_count
+                  << std::endl;
+
+        // Only save checkpoints every 10 epochs to reduce file clutter
+        if ((epoch + 1) % 10 == 0 || epoch == config_.epochs - 1) {
+            std::string ckpt = "checkpoint_epoch_" + std::to_string(epoch+1) + ".gguf";
+            if (use_so) model_so_.save(ckpt.c_str());
+            else program_.save(ckpt);
+        }
     }
-    std::string final_path = config_.model_path.empty() ? "final.gguf" : config_.model_path;
+    std::string final_path = config_.model_path.empty() ? "test.gguf" : config_.model_path;
     if (use_so) model_so_.save(final_path.c_str());
     else program_.save(final_path);
     std::cout << "Training complete. Model saved to " << final_path << std::endl;
+
+    // Clean up checkpoint & temp files
+    try {
+        for (int e = 1; e <= max_epochs; ++e) {
+            std::string ckpt = "checkpoint_epoch_" + std::to_string(e) + ".gguf";
+            if (std::ifstream(ckpt).good() && ckpt != final_path)
+                std::remove(ckpt.c_str());
+        }
+        if (std::ifstream("final.gguf").good() && "final.gguf" != final_path)
+            std::remove("final.gguf");
+        if (std::ifstream("interrupted.gguf").good())
+            std::remove("interrupted.gguf");
+        // Remove any stage_*.gguf files (except the final model)
+        for (int i = 0; i < 100; ++i) {
+            std::string stage = "stage_" + std::to_string(i) + ".gguf";
+            if (std::ifstream(stage).good() && stage != final_path)
+                std::remove(stage.c_str());
+        }
+        // Remove any .py files left over
+        try {
+            for (auto& entry : fs::directory_iterator(".")) {
+                if (entry.path().extension() == ".py")
+                    fs::remove(entry.path());
+            }
+        } catch (...) {}
+    } catch (...) {}
 
     // Очистить GPU-буферы плагина
     if (use_so && model_so_.handle) {
@@ -719,7 +794,23 @@ void UzaLEATCore::chat() {
         }
     }
 
-    // Если токенизатор не загрузился ни из файла, ни из GGUF — ошибка
+    // Fallback: если токенизатор всё ещё не загрузился (или загрузился криво <=256 токенов),
+    // пробуем tokenizer.bin в текущей папке (создаётся при тренировке)
+    if (tokenizer_.vocab_size() <= 256) {
+        std::string fallback_path = "tokenizer.bin";
+        if (std::ifstream(fallback_path).good()) {
+            try {
+                tokenizer_ = Tokenizer();  // сброс
+                tokenizer_.load(fallback_path);
+                std::cout << "Loaded tokenizer from " << fallback_path
+                          << " (vocab=" << tokenizer_.vocab_size() << ")" << std::endl;
+            } catch (const std::exception& e) {
+                std::cerr << "Fallback tokenizer load failed: " << e.what() << std::endl;
+            }
+        }
+    }
+
+    // Если токенизатор не загрузился — ошибка
     if (tokenizer_.vocab_size() == 0) {
         std::cerr << "Tokenizer not found. Provide --tokenizer or use a GGUF with embedded tokenizer.\n";
         return;
