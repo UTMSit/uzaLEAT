@@ -4,6 +4,7 @@ pkgs.mkShell {
   buildInputs = with pkgs; [
     gcc
     gnumake
+    pkg-config
     shaderc
     vulkan-headers
     vulkan-loader
